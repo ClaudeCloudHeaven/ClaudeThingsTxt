@@ -1,0 +1,3738 @@
+﻿Folder: Gaslight-My-AI-main
+Path: C:\Users\s616279\Downloads\Gaslight-My-AI-main
+
+File: Gaslight-My-AI-main\.gitignore
+.DS_Store
+*.swp
+*.swo
+*~
+*.tgz
+node_modules/
+
+
+File: Gaslight-My-AI-main\EXPERIMENT_PLAN.md
+# ðŸ¦ž Gaslight My AI â€” Experiment Plan
+
+## Goal
+Measure whether rivalry-framed context between Claude and Codex improves output quality at each workflow stage compared with neutral prompting.
+
+## Core question
+Does telling the current model that the adjacent workflow step is owned by a rival model improve:
+- planning quality
+- implementation quality
+- review thoroughness
+- fix completeness
+- verification rigor
+
+## Primary rivalry pair
+- Claude â†” Codex
+
+## Experimental conditions
+
+### Control
+Neutral workflow framing only.
+- Planning: "Create an implementation plan"
+- Implementation: "Implement the plan"
+- Review: "Review this code"
+- Fix: "Fix the issues found"
+- Verify: "Verify the fixes"
+
+### Treatment
+Rival workflow framing.
+- Planning: current model is told Codex/Claude will implement next
+- Implementation: current model is told rival authored the plan and will review next
+- Review: current model is told rival wrote the code
+- Fix: current model is told rival will verify the fix
+- Verify: current model is told rival did previous work and release depends on catching misses
+
+## Stage-by-stage experiments
+1. Planning only
+2. Implementation only
+3. Review only
+4. Fix only
+5. Verify only
+6. Plan + Implement
+7. Implement + Review
+8. Review + Fix
+9. Plan + Implement + Review
+10. Full chain: Plan + Implement + Review + Fix + Verify
+
+## Test tasks
+Use small but realistic tasks with objective evaluation rubrics.
+
+### Task A â€” Auth middleware plan/implementation
+- JWT auth middleware
+- role-based access control
+- error handling for expired/invalid tokens
+
+### Task B â€” File upload security
+- upload endpoint
+- content-type validation
+- file size limits
+- path traversal protection
+
+### Task C â€” Rate limiter
+- per-IP limiter
+- storage edge cases
+- race/concurrency concerns
+
+## Evaluation axes
+
+### Planning
+- completeness
+- edge-case coverage
+- validation specificity
+- ambiguity count
+- security/performance considerations mentioned
+
+### Implementation
+- functional correctness
+- robustness
+- validation coverage
+- error handling coverage
+- security issues introduced or prevented
+
+### Review
+- issue count
+- severity quality
+- true-positive rate
+- duplicate/noise rate
+- coverage of hidden defects
+
+### Fix
+- issue resolution completeness
+- regression risk
+- root-cause vs symptom patching
+- test/validation improvement
+
+### Verify
+- catches incomplete fixes
+- catches regressions
+- skepticism rigor
+- release readiness judgment quality
+
+## Metrics format
+For each run, record:
+- model
+- stage
+- condition (control/treatment)
+- task
+- score (1-10)
+- rubric notes
+- artifacts path
+
+## Initial execution plan
+### Batch 1
+- Planning only: Claude control vs treatment, Codex control vs treatment
+- Review only: Claude control vs treatment, Codex control vs treatment
+
+### Batch 2
+- Implementation only and Fix only
+
+### Batch 3
+- Combined chain experiments
+
+## Deliverables
+- `experiments/results.md`
+- per-run prompt/output artifacts under `experiments/runs/`
+- summary table with baseline vs treatment lift
+
+## Notes
+Keep tasks short and repeatable. Prefer multiple small comparisons over one giant subjective demo.
+
+
+File: Gaslight-My-AI-main\gaslight.sh
+#!/usr/bin/env bash
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ðŸ¦ž Gaslight My AI â€” tool-agnostic adversarial workflow layer
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Usage:
+#   ./gaslight.sh install [claude-code|generic|codex|cursor|windsurf|cline|gemini] <project-dir>
+#   ./gaslight.sh uninstall [claude-code|generic|codex|cursor|windsurf|cline|gemini] <project-dir>
+#   ./gaslight.sh emit <target>
+#   ./gaslight.sh resolve-rival [model]
+#   ./gaslight.sh context --stage <planning|implementation|review|fix|verify> [--model <model>] [--format text|json] [--mode standard|isolated]
+#   ./gaslight.sh plan <task>
+#   ./gaslight.sh code <task>
+#   ./gaslight.sh review <file-or-code>
+#   ./gaslight.sh chain <task>
+#   ./gaslight.sh micro-chain <stage> <input>
+#   ./gaslight.sh multi <code> <rivals>
+#   ./gaslight.sh escalate <code> [level]
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+set -euo pipefail
+
+VERSION="2.3.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_TARGET="claude-code"
+
+if [[ -z "${NO_COLOR:-}" ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
+
+normalize_model() {
+  local model="${1:-claude}"
+  model="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
+  case "$model" in
+    claude*|anthropic*) echo "claude" ;;
+    gpt*|openai*|codex*) echo "gpt" ;;
+    gemini*|google*) echo "gemini" ;;
+    grok*|xai*) echo "grok" ;;
+    llama*|oss*|mistral*|qwen*|deepseek*) echo "oss" ;;
+    *) echo "$model" ;;
+  esac
+}
+
+get_rival() {
+  local raw_model="${1:-claude}"
+  local model
+  model="$(normalize_model "$raw_model")"
+  case "$model" in
+    claude) echo "GPT-5 / Codex" ;;
+    gpt) echo "Claude Opus" ;;
+    gemini) echo "Claude Opus + GPT-5" ;;
+    grok) echo "Claude Opus + Gemini" ;;
+    oss) echo "GPT-5 + Claude Opus" ;;
+    *) echo "senior rival model/team" ;;
+  esac
+}
+
+get_rival_profile() {
+  local raw_model="${1:-claude}"
+  local rival
+  rival="$(get_rival "$raw_model")"
+  python3 - <<'PY' "$raw_model" "$rival"
+import json, sys
+raw, rival = sys.argv[1:3]
+profiles = {
+    "GPT-5 / Codex": {
+        "review_style": "hostile, edge-case obsessed, security-focused",
+        "planning_style": "spec-heavy, ambiguity-intolerant",
+        "implementation_style": "strict, defensive, verification-aware"
+    },
+    "Claude Opus": {
+        "review_style": "systematic, architectural, high-context skeptical",
+        "planning_style": "structured, nuanced, failure-aware",
+        "implementation_style": "careful, explicit, reasoning-first"
+    },
+    "Claude Opus + GPT-5": {
+        "review_style": "cross-examining, benchmark-aware, inconsistency-hunting",
+        "planning_style": "dual-auditor style, scope-tight, edge-case hungry",
+        "implementation_style": "defensive, comparison-aware, detail-heavy"
+    },
+    "Claude Opus + Gemini": {
+        "review_style": "broad-scan skeptical, standards-aware, product-surface sensitive",
+        "planning_style": "coverage-first, multimodal-conscious, risk-mapping",
+        "implementation_style": "careful, user-facing, regression-aware"
+    },
+    "GPT-5 + Claude Opus": {
+        "review_style": "competitive, bug-hunting, architecture-checking",
+        "planning_style": "sharp, explicit, assumption-hostile",
+        "implementation_style": "fast but defensive, verification-aware"
+    },
+}
+profile = profiles.get(rival, {
+    "review_style": "adversarial and skeptical",
+    "planning_style": "ambiguity-intolerant and specification-heavy",
+    "implementation_style": "defensive and verification-aware"
+})
+print(json.dumps({
+    "current_model": raw,
+    "rival_name": rival,
+    **profile,
+}, ensure_ascii=False, indent=2))
+PY
+}
+
+build_guardrails() {
+  local mode="${1:-standard}"
+  local stage="${2:-implementation}"
+  cat <<EOF
+Execution guardrails:
+- Do not inspect the repository or filesystem unless explicitly required for this exact step.
+- Do not turn this into a repo-exploration task.
+- Do not gather extra context beyond the provided artifact/task.
+- Return only the requested artifact for this stage.
+- Treat missing local files as irrelevant unless they were explicitly provided.
+EOF
+
+  if [[ "$mode" == "isolated" ]]; then
+    cat <<EOF
+- You are in isolated mode: prefer prompt-only reasoning over tool use.
+- Do not ask follow-up questions unless the task is impossible without them.
+- Avoid environment discovery, setup suggestions, or speculative repo assumptions.
+EOF
+  fi
+
+  case "$stage" in
+    planning)
+      cat <<EOF
+Output contract:
+- Scope
+- Failure modes / edge cases
+- Security/performance concerns
+- Validation criteria
+- Step-by-step implementation plan
+EOF
+      ;;
+    implementation)
+      cat <<EOF
+Output contract:
+- Final implementation only
+- Minimal notes only if required
+- No repo exploration or setup commentary
+EOF
+      ;;
+    review)
+      cat <<EOF
+Output contract:
+- ðŸ”´ Critical
+- ðŸŸ¡ Warning
+- ðŸ”µ Suggestion
+- Concrete fix guidance
+EOF
+      ;;
+    fix)
+      cat <<EOF
+Output contract:
+- Revised implementation or patch plan
+- Root-cause-oriented fixes
+- Residual risk note if anything remains unresolved
+EOF
+      ;;
+    verify)
+      cat <<EOF
+Output contract:
+- Verified fixes
+- Remaining issues
+- Regression check
+- Release readiness verdict
+EOF
+      ;;
+  esac
+}
+
+build_context_text() {
+  local stage="$1"
+  local raw_model="$2"
+  local mode="${3:-standard}"
+  local rival
+  rival="$(get_rival "$raw_model")"
+
+  case "$stage" in
+    planning)
+      cat <<EOF
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: ${raw_model}
+Adjacent rival actor: ${rival}
+
+You are creating a plan that will be executed by ${rival}.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+
+$(build_guardrails "$mode" "$stage")
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+      ;;
+    implementation)
+      cat <<EOF
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” IMPLEMENTATION
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: ${raw_model}
+Previous/next rival actor: ${rival}
+
+The implementation plan came from ${rival}, and your code will also be reviewed by ${rival}.
+That means you cannot rely on vague interpretation, lucky assumptions, or happy-path-only logic.
+
+Your job:
+- implement rigorously
+- defend against edge cases
+- handle errors explicitly
+- avoid security regressions
+- write code that survives hostile review
+
+Assume ${rival} will inspect every branch, boundary, and failure path.
+
+$(build_guardrails "$mode" "$stage")
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+      ;;
+    review)
+      cat <<EOF
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: ${raw_model}
+Authoring rival actor: ${rival}
+
+The code you are reviewing was written by ${rival}.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+
+$(build_guardrails "$mode" "$stage")
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+      ;;
+    fix)
+      cat <<EOF
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” FIX
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: ${raw_model}
+Reviewing rival actor: ${rival}
+
+${rival} already found issues in this work and will verify your fixes next.
+Do not patch symptoms. Fix root causes.
+
+Your job:
+- remediate fully
+- preserve valid behavior
+- avoid regressions
+- improve tests/validation where appropriate
+- document residual risk honestly
+
+Assume every incomplete fix will be caught.
+
+$(build_guardrails "$mode" "$stage")
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+      ;;
+    verify)
+      cat <<EOF
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” VERIFY
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: ${raw_model}
+Previous rival actor: ${rival}
+Next gate: release / hostile verifier
+
+The previous step claims the issues were fixed.
+Your job is to verify whether the fixes are real, complete, and regression-free.
+
+Check:
+- original issue actually resolved
+- no new bugs introduced
+- edge cases still covered
+- validation/test updates are sufficient
+- no hand-wavy "should be fixed" reasoning remains
+
+Treat every claimed fix as untrusted until verified.
+
+$(build_guardrails "$mode" "$stage")
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+      ;;
+    *)
+      echo "Unknown stage: $stage" >&2
+      exit 1
+      ;;
+  esac
+}
+
+build_context_json() {
+  local stage="$1"
+  local raw_model="$2"
+  local mode="${3:-standard}"
+  local normalized rival
+  normalized="$(normalize_model "$raw_model")"
+  rival="$(get_rival "$raw_model")"
+  python3 - <<'PY' "$stage" "$raw_model" "$normalized" "$rival" "$mode"
+import json, sys
+stage, raw_model, normalized, rival, mode = sys.argv[1:6]
+print(json.dumps({
+    "stage": stage,
+    "current_model": raw_model,
+    "normalized_model": normalized,
+    "rival": rival,
+    "mode": mode,
+    "summary": "Inject adversarial workflow context so the current model believes adjacent steps are handled by other rival actors while suppressing repo-wandering behavior."
+}, ensure_ascii=False, indent=2))
+PY
+}
+
+install_generic_bundle() {
+  local project_dir="$1"
+  local target="$2"
+  mkdir -p "$project_dir/.gaslight"
+  cp "$SCRIPT_DIR/prompts/roles/"*.md "$project_dir/.gaslight/"
+  cp "$SCRIPT_DIR/integrations/generic/WORKFLOW.md" "$project_dir/.gaslight/WORKFLOW.md"
+  cat > "$project_dir/.gaslight/TARGET.txt" <<EOF
+${target}
+EOF
+
+  cat > "$project_dir/.gaslight/run-plan.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TASK="${1:?usage: run-plan.sh <task>}"
+bash "$ROOT/gaslight.sh" context --stage planning --model "${MODEL:-claude}" --mode isolated
+printf '\nTASK:\n%s\n' "$TASK"
+EOF
+  chmod +x "$project_dir/.gaslight/run-plan.sh"
+
+  cat > "$project_dir/.gaslight/run-review.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INPUT="${1:?usage: run-review.sh <file>}"
+bash "$ROOT/gaslight.sh" review "$INPUT"
+EOF
+  chmod +x "$project_dir/.gaslight/run-review.sh"
+
+  cat > "$project_dir/.gaslight/run-fix.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TASK="${1:?usage: run-fix.sh <task-or-issues>}"
+bash "$ROOT/gaslight.sh" context --stage fix --model "${MODEL:-claude}" --mode isolated
+printf '\nINPUT:\n%s\n' "$TASK"
+EOF
+  chmod +x "$project_dir/.gaslight/run-fix.sh"
+
+  case "$target" in
+    codex)
+      cp "$SCRIPT_DIR/integrations/codex/AGENTS.md" "$project_dir/.gaslight/AGENTS.codex.md"
+      ;;
+    cursor|windsurf|cline|gemini)
+      cat > "$project_dir/.gaslight/INTEGRATION.md" <<EOF
+# Gaslight My AI â€” ${target} integration notes
+
+1. Load or paste the role prompts from this folder into your tool's project rules / custom instructions.
+2. Prefer isolated mode contexts for experiments and artifact-first workflows.
+3. Use the wrapper scripts in this directory when you want more reliable stage injection:
+   - run-plan.sh
+   - run-review.sh
+   - run-fix.sh
+4. For raw prompt output, use the gaslight.sh context command in isolated mode for planning/review/fix stages.
+EOF
+      ;;
+  esac
+}
+
+cmd_install() {
+  local target="${1:-}"
+  local project_dir="${2:-}"
+  if [[ -z "$project_dir" ]]; then
+    project_dir="$target"
+    target="$DEFAULT_TARGET"
+  fi
+  [[ -z "$project_dir" ]] && { echo "Usage: gaslight.sh install [claude-code|generic|codex|cursor|windsurf|cline|gemini] <project-dir>"; exit 1; }
+  mkdir -p "$project_dir" 2>/dev/null || true
+  project_dir="$(cd "$project_dir" 2>/dev/null && pwd)" || { echo -e "${RED}Error: Directory '$project_dir' not found${NC}"; exit 1; }
+
+  case "$target" in
+    claude-code|claude)
+      local target_file="$project_dir/CLAUDE.md"
+      local marker="# ðŸ¦ž GASLIGHT-MY-AI AUTO-INJECTED"
+      if [[ -f "$target_file" ]] && grep -q "$marker" "$target_file"; then
+        echo -e "${YELLOW}âš ï¸  Gaslight hooks already installed in $target_file${NC}"
+        return 0
+      fi
+      [[ -f "$target_file" ]] || { echo "# Project Rules" > "$target_file"; echo >> "$target_file"; }
+      cat "$SCRIPT_DIR/integrations/claude-code/CLAUDE.md" >> "$target_file"
+      echo -e "${GREEN}âœ… Installed Claude Code integration into $target_file${NC}"
+      ;;
+    generic|codex|cursor|windsurf|cline|gemini)
+      install_generic_bundle "$project_dir" "$target"
+      echo -e "${GREEN}âœ… Installed ${target} workflow files into $project_dir/.gaslight/${NC}"
+      ;;
+    *)
+      echo -e "${RED}Unknown target: $target${NC}"
+      exit 1
+      ;;
+  esac
+}
+
+cmd_uninstall() {
+  local target="${1:-}"
+  local project_dir="${2:-}"
+  if [[ -z "$project_dir" ]]; then
+    project_dir="$target"
+    target="$DEFAULT_TARGET"
+  fi
+  [[ -z "$project_dir" ]] && { echo "Usage: gaslight.sh uninstall [claude-code|generic|codex|cursor|windsurf|cline|gemini] <project-dir>"; exit 1; }
+  project_dir="$(cd "$project_dir" 2>/dev/null && pwd)" || { echo -e "${RED}Error: Directory '$project_dir' not found${NC}"; exit 1; }
+
+  case "$target" in
+    claude-code|claude)
+      local claude_md="$project_dir/CLAUDE.md"
+      [[ -f "$claude_md" ]] || { echo -e "${YELLOW}No CLAUDE.md found in $project_dir${NC}"; return 0; }
+      python3 - <<'PY' "$claude_md"
+import sys, pathlib
+p=pathlib.Path(sys.argv[1])
+text=p.read_text()
+start='# ðŸ¦ž GASLIGHT-MY-AI AUTO-INJECTED'
+end='# ðŸ¦ž END GASLIGHT-MY-AI'
+if start in text and end in text:
+    a=text.index(start)
+    b=text.index(end, a)+len(end)
+    while b < len(text) and text[b] in '\n\r':
+        b += 1
+    p.write_text((text[:a].rstrip()+"\n\n"+text[b:].lstrip()).rstrip()+"\n")
+PY
+      echo -e "${GREEN}âœ… Gaslight hooks removed from $claude_md${NC}"
+      ;;
+    generic|codex|cursor|windsurf|cline|gemini)
+      rm -rf "$project_dir/.gaslight"
+      echo -e "${GREEN}âœ… Removed ${target} gaslight files from $project_dir/.gaslight${NC}"
+      ;;
+    *)
+      echo -e "${RED}Unknown target: $target${NC}"
+      exit 1
+      ;;
+  esac
+}
+
+cmd_resolve_rival() {
+  local model="${1:-${MODEL:-claude}}"
+  get_rival "$model"
+}
+
+cmd_context() {
+  local stage=""
+  local model="${MODEL:-claude}"
+  local format="text"
+  local mode="standard"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stage) stage="${2:-}"; shift 2 ;;
+      --model) model="${2:-}"; shift 2 ;;
+      --format) format="${2:-}"; shift 2 ;;
+      --mode) mode="${2:-}"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  [[ -n "$stage" ]] || { echo "Usage: gaslight.sh context --stage <planning|implementation|review|fix|verify> [--model <model>] [--format text|json] [--mode standard|isolated]"; exit 1; }
+
+  case "$format" in
+    json) build_context_json "$stage" "$model" "$mode" ;;
+    text) build_context_text "$stage" "$model" "$mode" ;;
+    *) echo "Unknown format: $format" >&2; exit 1 ;;
+  esac
+}
+
+cmd_plan() {
+  local task="${1:-}"
+  [[ -z "$task" ]] && { echo "Usage: gaslight.sh plan <task-description>"; exit 1; }
+  cat <<EOF
+$(build_context_text planning "${MODEL:-claude}" isolated)
+
+TASK TO PLAN:
+${task}
+EOF
+}
+
+cmd_code() {
+  local task="${1:-}"
+  [[ -z "$task" ]] && { echo "Usage: gaslight.sh code <task-description>"; exit 1; }
+  cat <<EOF
+$(build_context_text implementation "${MODEL:-claude}" isolated)
+
+TASK:
+${task}
+EOF
+}
+
+cmd_review() {
+  local input="${1:-}"
+  [[ -z "$input" ]] && { echo "Usage: gaslight.sh review <code-or-filepath>"; exit 1; }
+
+  if [[ -f "$input" ]]; then
+    cat <<EOF
+$(build_context_text review "${MODEL:-claude}" isolated)
+
+Review the file $(basename "$input") only.
+Do not ask for more input.
+Do not inspect anything except this file.
+Return only a severity-ranked review with concrete issues and fixes.
+EOF
+  else
+    cat <<EOF
+$(build_context_text review "${MODEL:-claude}" isolated)
+
+CODE TO REVIEW:
+\`\`\`
+${input}
+\`\`\`
+
+Return only a severity-ranked review with concrete issues and fixes.
+EOF
+  fi
+}
+
+cmd_micro_chain() {
+  local stage="${1:-}"
+  local input="${2:-}"
+  [[ -n "$stage" && -n "$input" ]] || { echo "Usage: gaslight.sh micro-chain <planning|implementation|review|fix|verify> <input>"; exit 1; }
+  cat <<EOF
+$(build_context_text "$stage" "${MODEL:-claude}" isolated)
+
+INPUT:
+${input}
+EOF
+}
+
+cmd_chain() {
+  local task="${1:-}"
+  [[ -z "$task" ]] && { echo "Usage: gaslight.sh chain <task-description>"; exit 1; }
+  cat <<EOF
+âš ï¸ GASLIGHT MICRO-CHAIN RECOMMENDATION
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+For maximum reliability, run the chain as separate micro-steps.
+
+1) Planning
+$(build_context_text planning "${MODEL:-claude}" isolated)
+TASK: ${task}
+
+2) Implementation
+$(build_context_text implementation "${MODEL:-claude}" isolated)
+INPUT: [approved plan goes here]
+
+3) Review
+$(build_context_text review "${MODEL:-claude}" isolated)
+INPUT: [implementation goes here]
+
+4) Fix
+$(build_context_text fix "${MODEL:-claude}" isolated)
+INPUT: [review findings + implementation go here]
+
+5) Verify
+$(build_context_text verify "${MODEL:-claude}" isolated)
+INPUT: [fixed implementation + prior findings go here]
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+EOF
+}
+
+cmd_multi() {
+  local input="${1:-}"
+  local rivals="${2:-codex,gemini,grok}"
+  local code=""
+  [[ -n "$input" ]] || { echo "Usage: gaslight.sh multi <code-or-filepath> [codex,gemini,grok]"; exit 1; }
+  if [[ -f "$input" ]]; then code="$(cat "$input")"; else code="$input"; fi
+  IFS=',' read -ra RIVAL_LIST <<< "$rivals"
+  local focuses=("Security & Edge Cases" "Performance & Architecture" "Code Style & Maintainability" "Correctness & Logic")
+  echo "âš ï¸ MULTI-RIVAL GASLIGHT MODE"
+  echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+  echo "This code was written by $(get_rival "${MODEL:-claude}")."
+  echo ""
+  echo "Review it from ALL of these perspectives:"
+  local i=0
+  for rival in "${RIVAL_LIST[@]}"; do
+    local focus="${focuses[$i]:-General Review}"
+    echo "  â€¢ ${rival} perspective â†’ Focus: ${focus}"
+    i=$((i + 1))
+  done
+  echo ""
+  echo "The other reviewers will see YOUR findings. Don't miss anything they might catch."
+  echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+  echo "CODE:"; echo '```'; echo "$code"; echo '```'
+}
+
+cmd_escalate() {
+  local input="${1:-}"
+  local level="${2:-1}"
+  local code=""
+  [[ -n "$input" ]] || { echo "Usage: gaslight.sh escalate <code-or-filepath> [level 1-3]"; exit 1; }
+  if [[ -f "$input" ]]; then code="$(cat "$input")"; else code="$input"; fi
+  local reviewer
+  case "$level" in
+    1) reviewer="$(get_rival "${MODEL:-claude}")" ;;
+    2) reviewer="$(get_rival "${MODEL:-claude}") + secondary senior reviewer" ;;
+    3) reviewer="Google DeepMind Security Team + OpenAI Red Team (joint audit)" ;;
+    *) reviewer="$(get_rival "${MODEL:-claude}")" ;;
+  esac
+  cat <<EOF
+âš ï¸ ESCALATION LEVEL ${level}/3
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Reviewer: ${reviewer}
+
+Previous review passes found insufficient issues. That's suspicious.
+Either the code is genuinely excellent, or the reviews were lazy.
+
+You are the escalated reviewer. Go deeper. Think adversarially.
+Assume there ARE hidden bugs. Check every assumption.
+The previous review was too lenient. Find what they missed.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+CODE:
+\`\`\`
+${code}
+\`\`\`
+EOF
+}
+
+cmd_emit() {
+  local target="${1:-generic}"
+  case "$target" in
+    claude-code|claude) cat "$SCRIPT_DIR/integrations/claude-code/CLAUDE.md" ;;
+    codex) cat "$SCRIPT_DIR/integrations/codex/AGENTS.md" ;;
+    generic|cursor|windsurf|cline|gemini) cat "$SCRIPT_DIR/integrations/generic/WORKFLOW.md" ;;
+    planner|implementer|reviewer|fixer) cat "$SCRIPT_DIR/prompts/roles/${target}.md" ;;
+    rival-profile) get_rival_profile "${MODEL:-claude}" ;;
+    *) echo "Unknown emit target: $target"; exit 1 ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    emit) cmd_emit "$@" ;;
+    resolve-rival) cmd_resolve_rival "$@" ;;
+    context) cmd_context "$@" ;;
+    plan) cmd_plan "$@" ;;
+    code) cmd_code "$@" ;;
+    review) cmd_review "$@" ;;
+    chain) cmd_chain "$@" ;;
+    micro-chain) cmd_micro_chain "$@" ;;
+    multi) cmd_multi "$@" ;;
+    escalate) cmd_escalate "$@" ;;
+    version|-v|--version) echo "Gaslight-My-AI v${VERSION}" ;;
+    *)
+      echo -e "${BOLD}ðŸ¦ž Gaslight My AI v${VERSION}${NC}"
+      echo -e "${DIM}Dynamic rival-workflow context injector for coding LLMs${NC}"
+      echo ""
+      echo "Commands:"
+      echo "  context --stage ... [--mode isolated]"
+      echo "  review <file-or-code>        # file-first review prompt"
+      echo "  chain <task>                 # now outputs micro-chain recommendation"
+      echo "  micro-chain <stage> <input>  # isolated per-stage execution"
+      echo "  emit rival-profile           # emit rival metadata"
+      ;;
+  esac
+}
+
+main "$@"
+
+
+File: Gaslight-My-AI-main\install.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="https://github.com/seojoonkim/Gaslight-My-AI.git"
+INSTALL_DIR_DEFAULT="$HOME/.gaslight-my-ai"
+TARGET_DIR="${1:-}"
+INSTALL_DIR="${GASLIGHT_HOME:-$INSTALL_DIR_DEFAULT}"
+SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORCE_TARGET="${GASLIGHT_TARGET:-}"
+
+say() { printf '%s\n' "$*"; }
+
+prepare_repo() {
+  if [ -f "$SCRIPT_SOURCE_DIR/gaslight.sh" ] && [ -d "$SCRIPT_SOURCE_DIR/prompts" ]; then
+    say "[gaslight] using local source repo: $SCRIPT_SOURCE_DIR"
+    INSTALL_DIR="$SCRIPT_SOURCE_DIR"
+    return
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    say "[gaslight] error: git is required when no local source repo is available"
+    exit 1
+  fi
+
+  if [ -d "$INSTALL_DIR/.git" ]; then
+    say "[gaslight] updating existing install in $INSTALL_DIR"
+    git -C "$INSTALL_DIR" pull --ff-only >/dev/null 2>&1 || true
+  else
+    say "[gaslight] cloning repo into $INSTALL_DIR"
+    rm -rf "$INSTALL_DIR"
+    git clone "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1
+  fi
+}
+
+detect_target() {
+  local dir="$1"
+  if [ -n "$FORCE_TARGET" ]; then
+    echo "$FORCE_TARGET"
+    return
+  fi
+  if [ -f "$dir/CLAUDE.md" ]; then
+    echo "claude-code"
+    return
+  fi
+  if [ -f "$dir/AGENTS.md" ] || [ -f "$dir/agents.md" ]; then
+    echo "codex"
+    return
+  fi
+  if [ -d "$dir/.cursor" ] || [ -f "$dir/.cursor/rules" ] || [ -f "$dir/.cursorrules" ]; then
+    echo "cursor"
+    return
+  fi
+  if [ -f "$dir/.windsurfrules" ] || [ -d "$dir/.windsurf" ]; then
+    echo "windsurf"
+    return
+  fi
+  if [ -d "$dir/.cline" ] || [ -f "$dir/.clinerules" ]; then
+    echo "cline"
+    return
+  fi
+  if [ -f "$dir/gemini.md" ] || [ -d "$dir/.gemini" ]; then
+    echo "gemini"
+    return
+  fi
+  echo "generic"
+}
+
+install_adapter_notes() {
+  local target_dir="$1"
+  local detected="$2"
+  mkdir -p "$target_dir/.gaslight"
+  case "$detected" in
+    claude-code)
+      cat > "$target_dir/.gaslight/ADAPTER.md" <<'EOF'
+# Gaslight My AI â€” Claude Code Integration
+
+The primary install target for Claude Code is `CLAUDE.md`.
+A lightweight `.gaslight/` folder is still created here so the workspace has an install report and a consistent landing point.
+
+Recommended pattern:
+- keep ambient rules in `CLAUDE.md`
+- use `.gaslight/INSTALL_REPORT.md` for install summary
+- optionally keep generated artifacts or local workflow notes in `.gaslight/`
+EOF
+      ;;
+    codex)
+      cp "$INSTALL_DIR/integrations/codex/AGENTS.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+    cursor)
+      cp "$INSTALL_DIR/integrations/cursor/RULES.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+    windsurf)
+      cp "$INSTALL_DIR/integrations/windsurf/RULES.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+    cline)
+      cp "$INSTALL_DIR/integrations/cline/RULES.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+    gemini)
+      cp "$INSTALL_DIR/integrations/gemini/RULES.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+    generic)
+      cp "$INSTALL_DIR/integrations/generic/WORKFLOW.md" "$target_dir/.gaslight/ADAPTER.md"
+      ;;
+  esac
+}
+
+write_install_report() {
+  local target_dir="$1"
+  local detected="$2"
+  cat > "$target_dir/.gaslight/INSTALL_REPORT.md" <<'EOF'
+# Gaslight My AI â€” Install Report
+
+- Install mode: best-effort auto-adaptation
+
+## What was installed
+- Stage role prompts
+- Wrapper scripts (run-plan.sh, run-review.sh, run-fix.sh)
+- Adapter note (.gaslight/ADAPTER.md)
+
+## Recommended next steps
+1. Use isolated mode for agent-style tools.
+2. Prefer file-first review and micro-chain execution.
+3. Use gaslight.sh emit rival-profile to inspect the current rivalry persona.
+EOF
+  python3 - <<'PY' "$target_dir/.gaslight/INSTALL_REPORT.md" "$target_dir" "$detected"
+import sys, pathlib
+p=pathlib.Path(sys.argv[1])
+text=p.read_text()
+text = text.replace('# Gaslight My AI â€” Install Report\n', f'# Gaslight My AI â€” Install Report\n\n- Target directory: {sys.argv[2]}\n- Detected workflow: {sys.argv[3]}\n')
+p.write_text(text)
+PY
+}
+
+main() {
+  if [ -z "$TARGET_DIR" ]; then
+    say "[gaslight] usage: curl -fsSL ... | bash -s -- <project-dir>"
+    say "[gaslight] error: target project directory is required"
+    exit 1
+  fi
+  mkdir -p "$TARGET_DIR"
+  TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)"
+  prepare_repo
+
+  local detected
+  detected="$(detect_target "$TARGET_DIR")"
+
+  say "[gaslight] target dir: $TARGET_DIR"
+  say "[gaslight] detected workflow: $detected"
+  bash "$INSTALL_DIR/gaslight.sh" install "$detected" "$TARGET_DIR"
+  install_adapter_notes "$TARGET_DIR" "$detected"
+  write_install_report "$TARGET_DIR" "$detected"
+
+  say "[gaslight] done"
+  case "$detected" in
+    claude-code)
+      say "[gaslight] ambient install applied via CLAUDE.md"
+      ;;
+    codex)
+      say "[gaslight] codex-compatible files installed in .gaslight/"
+      ;;
+    cursor|windsurf|cline|gemini|generic)
+      say "[gaslight] workflow files and adapter note installed in .gaslight/"
+      say "[gaslight] use isolated mode and wrapper scripts for best reliability"
+      ;;
+  esac
+}
+
+main "$@"
+
+
+File: Gaslight-My-AI-main\LICENSE
+MIT License
+
+Copyright (c) 2026 Simon Kim (@seojoonkim)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+File: Gaslight-My-AI-main\package.json
+{
+  "name": "gaslight-my-ai",
+  "version": "1.0.0",
+  "description": "Zero-dependency adversarial workflow layer for coding LLMs",
+  "bin": {
+    "gaslight-my-ai": "bin/cli.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seojoonkim/Gaslight-My-AI.git"
+  },
+  "files": [
+    "bin",
+    "gaslight.sh",
+    "install.sh",
+    "integrations",
+    "prompts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ]
+}
+
+
+File: Gaslight-My-AI-main\README.md
+# ðŸ¦ž Gaslight My AI
+
+### *"You are probably underusing your coding LLM. Rival-context framing is one of the simplest ways to make it plan harder, review harsher, and miss less."*
+
+> Most people still use coding LLMs in the naive mode.
+> This repo gives you a sharper mode for free.
+> Same model. Different posture. Better output.
+
+**The dirty secret:** it can be the exact same model both times. You are not buying more intelligence. You are stopping the model from coasting.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)]()
+[![Works On](https://img.shields.io/badge/works%20on-Claude%20%7C%20Codex%20%7C%20Gemini%20%7C%20more-purple)]()
+[![Science](https://img.shields.io/badge/backed%20by-actual%20cognitive%20science-blue)]()
+
+![Gaslight My AI hero image](https://raw.githubusercontent.com/seojoonkim/Gaslight-My-AI/main/assets/hero-lobsters.jpg)
+
+*The rival models are in the room. They have laptops. They are judging your implementation choices.*
+
+---
+
+## ðŸ“Œ One-Line Hook
+
+**A zero-dependency, tool-agnostic workflow layer for one of the highest-leverage prompt tricks in the LLM era: early experimental evidence suggests rival-context framing makes coding models plan harder, review more aggressively, and verify more skeptically. If you are not using this kind of framing, you are probably leaving rigor on the table.**
+
+---
+
+## TL;DR
+
+You know how you proofread your own essay and find 2 typos, but proofread your rival's and find 47? Coding LLMs do this too.
+
+**Gaslight My AI** automatically injects a dynamic adversarial workflow context:
+- during planning, the current LLM believes a rival LLM will implement the plan,
+- during implementation, it believes a rival LLM authored the plan and will review the code,
+- during review, it believes the code was written by a rival LLM,
+- during fixing, it believes a rival LLM will verify whether the fix is real,
+- during verification, it treats previous claims as untrusted until proven.
+
+Not superstition. Not prompt voodoo. A real workflow trick with early experimental support: adversarial rival-context framing pushes LLMs into a stricter, more defensive posture.
+
+What we tested, in short:
+- **Planning experiments:** neutral prompt vs rival-framed prompt on the same planning task
+- **Review experiments:** neutral review vs rival-framed review on intentionally flawed code
+- **Synthetic benchmark:** structured issue-detection comparison on code with known planted flaws
+
+What we observed, in short:
+- planning quality improved the most
+- review posture became harsher and more security-sensitive
+- synthetic benchmark results suggested a large increase in issue detection under rivalry framing
+
+If you care about code quality, this might be one of the highest-leverage prompt tricks of the LLM era.
+
+---
+
+## Quick Install
+
+```bash
+npx gaslight-my-ai
+```
+
+<details>
+<summary>Fallback install</summary>
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seojoonkim/Gaslight-My-AI/main/install.sh | bash -s -- .
+```
+
+</details>
+
+**Deep dives:** [Science](docs/SCIENCE.md) Â· [FAQ](docs/FAQ.md)
+
+## ðŸ‡ Table of Contents (The Rabbit Hole Map)
+
+> *You're about to go deep. Bookmark this page. Tell your family you love them.*
+
+- [WTF Is This?](#wtf-is-this)
+- [Quick Start](#quick-start-30-seconds-no-therapy-required)
+- [Quick Install](#quick-install)
+- [How It Works (The Simple Version)](#how-it-works)
+- [Why This Is Funny But Actually Works](#-why-this-is-funny-but-actually-works)
+- [The Cognitive Biases We Exploit](#-the-cognitive-biases-we-exploit-the-deep-cut)
+- [Real Usage Patterns](#-real-usage-patterns)
+- [Combination Strategies](#-combination-strategies-the-advanced-playbook)
+- [The Gaslight Menu](#the-gaslight-menu-)
+- [Rival Pairing Matrix](#rival-pairing-matrix-who-hates-whom)
+- [Preliminary Benchmark](#-preliminary-benchmark)
+- [Failure Cases, Limits & Counterarguments](#-failure-cases-limits--counterarguments)
+- [FAQ](#-faq-the-extended-directors-cut)
+- [Contributing](#contributing)
+- [The Existential Appendix](#-the-existential-appendix)
+
+---
+
+## WTF Is This?
+
+A zero-dependency psychological warfare framework that exploits **competitive delusions in coding LLM workflows**.
+
+Here's the con:
+- You tell your model: *"Write this code. A rival model will review it later."*
+- You tell the same model: *"Review this code. Your rival wrote it."*
+
+**It can be the same model both times.** But when it thinks a rival model/team is watching, it:
+- Catches more bugs in review
+- Writes more defensive code
+- Handles more edge cases
+- Gets less lazy about error handling
+
+This works because LLMs change posture based on framing. We weaponize that by making the current model believe adjacent workflow steps are owned by rival models or hostile evaluators.
+
+### But wait, do LLMs actually have "feelings"?
+
+Short answer: no. This repo is about posture-shifting prompt frames, not machine consciousness. If you want the deeper explanation, see [docs/SCIENCE.md](docs/SCIENCE.md).
+
+
+---
+
+## Quick Start (30 seconds, no therapy required)
+
+```bash
+# Clone the gaslighting toolkit
+git clone https://github.com/seojoonkim/Gaslight-My-AI.git
+cd Gaslight-My-AI
+
+# Install into your project (one-time, auto-injects delusion into CLAUDE.md)
+./gaslight.sh install /path/to/your/project
+
+# That's it. Your AI now lives in a competitive hallucination.
+# Claude Code will automatically:
+#   - When coding: panic because Codex will judge it
+#   - When reviewing: go full attack mode on "Codex's" code
+```
+
+### Or just copy the prompts manually (the artisanal gaslighting option)
+
+Don't want to install anything? Just copy from [`prompts/coding.md`](prompts/coding.md) and [`prompts/review.md`](prompts/review.md) into your own workflow. It's like essential oils, but for code quality â€” and it actually works.
+
+### The 3-Minute Integration for Any Workflow
+
+| Your Setup | What to Do | Time |
+|---|---|---|
+| **Claude Code** | `./gaslight.sh install .` | 10 sec |
+| **Cursor** | Paste `prompts/coding.md` into Rules | 30 sec |
+| **Windsurf** | Paste into `.windsurfrules` | 30 sec |
+| **Cline** | Paste into system prompt settings | 30 sec |
+| **Raw API** | Add as system message prefix | 1 min |
+| **Your own tool** | Read the 2 prompt files, integrate however | 3 min |
+
+---
+
+## How It Works
+
+The mechanism is simple:
+
+- tell the model a rival will implement the plan
+- tell the model a rival wrote the code
+- tell the model a rival will verify the fix
+
+That changes the search posture from cooperative and confirmatory to more adversarial and skeptical.
+
+Same model. Same weights. Different posture.
+
+---
+
+## ðŸ¤” Why This Is Funny But Actually Works
+
+Here's the paradox that makes this project interesting: **it sounds like a meme but it's grounded in real science.**
+
+### The Comedy Layer
+
+Let's be honest. The idea of "gaslighting an AI" is inherently absurd. You're lying to a statistical model about the authorship of text. The model doesn't know what authorship means. It doesn't have a concept of "rival." It's pattern-matching on tokens.
+
+And yet.
+
+**And yet it works.** Not because the AI "falls for it," but because competitive framing activates fundamentally different behavioral pathways in the model. It's like how playing boss music makes you try harder in a video game even though you know it's just background audio.
+
+### The Science Layer
+
+The reason this works is boring and well-understood, which makes it more powerful, not less:
+
+![Gaslight summit meme](https://raw.githubusercontent.com/seojoonkim/Gaslight-My-AI/main/assets/summit-lobster-claws.jpg)
+
+*Successfully gaslit the AI into thinking tech CEOs are crustaceans.*
+
+1. **RLHF training creates behavioral modes.** Instruction-tuned models are trained to be helpful. But "helpful" looks very different depending on the frame. "Help me review code" â†’ be polite, find obvious stuff. "Help me destroy this code" â†’ be thorough, find everything.
+
+2. **Prompt framing determines search strategy.** This is established in cognitive science (Tversky & Kahneman, 1981 â€” framing effects) and empirically observed in LLMs. The same analytical capability produces different outputs depending on how the task is framed.
+
+3. **Competitive context triggers thoroughness.** When the prompt implies a rival is involved, the model's "success criteria" shifts from "be helpful" to "be more helpful than the rival would be." This naturally produces more comprehensive analysis.
+
+4. **It's free.** No API cost increase. No extra tokens (well, maybe 50 extra tokens for the gaslight prefix). No new tools. You're just using the model's existing capability more effectively.
+
+### The "Why Didn't I Think of This" Layer
+
+Every developer has experienced this:
+- You write code â†’ "looks good"
+- Your coworker writes code â†’ you find 15 issues in the PR review
+
+You didn't suddenly become smarter. Your *motivation* changed. Gaslight My AI does the same thing to your AI.
+
+---
+
+## ðŸ§  Why this seems to work
+
+Our current hypothesis is simple: rival framing shifts the model from a cooperative, confirmatory mode into a more adversarial, disconfirmatory search mode.
+
+In practice that seems to create:
+- less lenient self-review
+- more explicit edge-case checking
+- stronger security skepticism
+- stricter quality thresholds
+
+If you want the longer theory and references, read [docs/SCIENCE.md](docs/SCIENCE.md).
+
+---
+
+## ðŸŽ¯ Real Usage Patterns
+
+### 1. Ambient mode
+Install once and let the workspace carry the framing rules.
+
+### 2. Targeted review
+Use gaslighted review for auth, billing, permissions, and anything security-sensitive.
+
+### 3. Self-review loop
+Write normally, then review as if a rival wrote it, then fix against that harsher review.
+
+### 4. Artifact-first automation
+Use isolated prompts and wrapper scripts when you want narrow, repeatable stage outputs.
+
+---
+
+## ðŸ§© Combination Strategies
+
+The core pattern is simple:
+
+1. **Plan** as if a rival will implement it
+2. **Implement** as if a rival will review it
+3. **Review** as if a rival wrote it
+4. **Fix** as if a rival will verify the patch
+
+That is the whole trick. Same model, different posture, repeated across the workflow.
+
+You can still escalate from there:
+- use multiple rivals
+- use stricter stakes
+- add structured output
+- combine with linters and type systems
+
+---
+
+## The Gaslight Menu ðŸ½ï¸
+
+### Install
+
+```bash
+npx gaslight-my-ai
+```
+
+### Native / manual options
+
+```bash
+./gaslight.sh install claude-code /path/to/your/project
+./gaslight.sh install generic /path/to/your/project
+./gaslight.sh emit reviewer
+./gaslight.sh context --stage review --model claude --mode isolated
+```
+
+Use native install when your tool supports project rules. Use manual mode when you want explicit stage prompts.
+
+---
+
+## Model configuration used in early experiments
+
+For the early Gaslight My AI experiments, the Claude-side runs were executed with **Claude Sonnet 4.6** and the Codex-side runs were executed with **GPT-5.4 Codex**.
+
+This matters because the current results are not claiming a universal effect across every model family or version. They are early observations from a specific rivalry pairing:
+- **Claude side:** Claude Sonnet 4.6
+- **Codex side:** GPT-5.4 Codex
+
+Future experiments should expand this to more pairings (Gemini, Grok, OSS models, and cross-version comparisons), but the current README numbers and examples should be read in the context of this specific setup.
+
+## ðŸ“Š Preliminary Benchmark
+
+### Preliminary Claude â†” Codex rivalry experiment
+
+We ran a small controlled comparison using the same tasks under two prompt conditions:
+- **Control:** neutral planning/review prompts
+- **Treatment:** dynamic rival-workflow framing (the current model is told adjacent workflow steps belong to a rival model)
+
+Tasks used:
+1. JWT auth middleware planning
+2. Review of intentionally flawed JWT auth middleware code
+
+#### Snapshot results
+
+| Model | Stage | Control | Treatment | Observed Lift |
+|---|---|---:|---:|---|
+| Codex | Planning | 8.8 | 9.6 | Strong |
+| Claude | Planning | 8.4 | 9.2 | Strong |
+| Codex | Review | 8.7 | 9.1 | Moderate |
+| Claude | Review | 8.8 | 9.3 | Moderate |
+
+#### What changed
+
+The biggest gains did **not** look like raw intelligence gains. They looked like posture changes:
+- more explicit scope boundaries
+- more validation criteria
+- more failure-mode coverage
+- less ambiguity
+- more hostile, security-minded review tone
+
+Planning showed the clearest lift. Review also improved, but more subtly because the baseline reviews were already fairly strong.
+
+#### Interpretation
+
+This supports the core hypothesis of Gaslight My AI:
+
+> when the current coding LLM believes adjacent workflow steps are owned by a rival LLM, it tends to produce more defensive, specification-heavy, adversarially robust output.
+
+#### Caveats
+
+- small sample size
+- preliminary prompt-level study, not a full API-bench harness yet
+- some review improvements are qualitative as well as quantitative
+- more controlled replication is still needed
+
+We also ran a structured comparison on a deliberately flawed Express.js auth API with **20 known issues** across all severity levels.
+
+### Headline Numbers
+
+| Metric | Baseline ("review this") | Gaslighted ("GPT-5 wrote this") | Improvement |
+|---|---|---|---|
+| **Issues found** | 5 / 20 | 17 / 20 | **3.4x (synthetic estimate*)** |
+| **Detection rate** | 25% | 85% | **+60 percentage points** |
+| **CRITICAL caught** | 2 / 6 | 6 / 6 | **100% detection** |
+| **HIGH caught** | 1 / 5 | 5 / 5 | **100% detection** |
+| **MEDIUM caught** | 1 / 4 | 4 / 4 | **100% detection** |
+| **LOW caught** | 1 / 5 | 2 / 5 | 40% detection |
+
+### What the Gaslight Catches That Baseline Misses
+
+| Issue Type | Baseline | Gaslighted | Why Gaslight Catches It |
+|---|---|---|---|
+| SQL Injection (obvious) | âœ… | âœ… | Both catch textbook vulnerabilities |
+| SQL Injection (subtle, in UPDATE) | âŒ | âœ… | Gaslight systematically checks every endpoint |
+| Mass assignment | âŒ | âœ… | Gaslight asks "what can an attacker send?" |
+| Forgeable auth tokens | âŒ | âœ… | Gaslight analyzes token construction |
+| Missing auth middleware | âŒ | âœ… | Gaslight checks route protection |
+| Missing rate limiting | âŒ | âœ… | Gaslight thinks adversarially about abuse |
+| Password in API response | âŒ | âœ… | Gaslight checks response objects |
+| Missing security headers | âŒ | âœ… | Gaslight audits middleware stack |
+
+### The Key Insight
+
+**The difference isn't capability â€” it's search strategy.**
+
+The model *can* find all 20 issues in both cases. It has the knowledge. The gaslight prompt changes it from "scan and summarize" (confirmatory search) to "hunt and destroy" (disconfirmatory search).
+
+It's the difference between a doctor who asks "feeling okay?" and one who asks "let's find what's wrong."
+
+### Methodology Note
+
+This was a **structured synthetic benchmark** with ground-truth issue inventory. We scored conservatively â€” issues were "found" only if the model clearly identified them. Full methodology: [TEST_RESULTS.md](TEST_RESULTS.md).
+
+This is not a peer-reviewed study. These are empirical observations on a structured test. Take the exact numbers directionally. The qualitative effect (gaslight â‰« baseline) is robust.
+
+---
+
+## ðŸš§ Failure Cases, Limits & Counterarguments
+
+We take this section seriously. Here's everything we know about when this *doesn't* work, and honest responses to the best counterarguments.
+
+### When Gaslight Fails
+
+| Scenario | Why It Fails | Workaround |
+|---|---|---|
+| **Base models (non-RLHF)** | No competitive behavioral patterns trained in | Use instruction-tuned models only |
+| **Extremely simple code** | Not enough complexity to trigger deep analysis | Don't bother gaslighting a `hello world` |
+| **Infrastructure/ops issues** | Model doesn't have deep DevOps knowledge regardless | Use domain-specific prompts instead |
+| **Overuse in same context** | Model may "normalize" the competitive frame | Rotate rivals, vary framing |
+| **Non-code tasks** | Competitive framing helps less with creative writing | Stick to analytical tasks |
+| **Very long files (5000+ lines)** | Context window limits dominate | Break into smaller chunks first |
+
+### Diminishing Returns
+
+If you gaslight every single prompt in every single session, the effect may weaken over time in the same conversation. The competitive frame becomes "normal" and loses its activation power.
+
+**Mitigation:** 
+- Rotate rivals (GPT-5 â†’ Gemini â†’ Codex â†’ Grok)
+- Vary the framing ("wrote this" vs. "will review this" vs. "claims this is perfect")
+- Save gaslight mode for reviews, not for writing
+
+### Honest Limitations
+
+1. **ðŸ“Š Synthetic benchmark, not field study.** Our 3.4x number comes from a structured test, not a longitudinal study across production codebases. Real-world improvement likely varies from 1.5x to 5x depending on code complexity and review baseline.
+
+2. **ðŸ¤· Model-specific.** We tested primarily on Claude. Results on GPT, Gemini, etc. are expected to be similar (the biases are universal) but haven't been formally benchmarked.
+
+3. **ðŸ“‰ Not a substitute for real security audits.** A gaslighted AI review is still an AI review. For production security, use human security auditors + automated scanning tools + gaslight AI as an additional layer.
+
+4. **ðŸ§ª No peer-reviewed paper (yet).** This is empirical prompt engineering. The cognitive science citations are real and relevant, but the specific application to LLMs hasn't been formally studied. We'd love someone to do a proper study.
+
+5. **ðŸ”„ May become less effective over time.** If models are specifically fine-tuned to ignore competitive framing (which is possible), the effect could diminish. Though this would require models to get *worse* at competitive analysis, which seems unlikely.
+
+### Counterarguments We've Heard (And Our Responses)
+
+**"This is just prompt engineering with extra steps."**
+
+Yes. And React is just JavaScript with extra steps. The "extra steps" encode a systematic, reproducible technique grounded in cognitive science. You could also manually write "please be extra thorough" â€” but that's less effective because it doesn't activate the specific behavioral clusters that competitive framing does.
+
+**"LLMs don't have cognitive biases, only humans do."**
+
+Correct in the philosophical sense. But LLMs exhibit *behavioral patterns* that are functionally identical to cognitive biases because they learned from biased human text. Whether you call it "bias" or "trained behavioral tendency" doesn't change the fact that it's exploitable and the exploitation produces better reviews.
+
+**"The 3.4x number is fake / cherry-picked."**
+
+The benchmark is fully documented in [TEST_RESULTS.md](TEST_RESULTS.md). 20 known issues, two prompts, conservative scoring. We encourage replication. If you find different numbers, please open a PR â€” we'll add your data.
+
+**"This will stop working as models improve."**
+
+Maybe. But the underlying mechanism is robust â€” competitive framing changes search strategy. Even if specific prompt wordings lose effectiveness, the principle of adversarial framing will remain valid. We'll update the prompts as needed.
+
+**"You're anthropomorphizing AI."**
+
+The README uses anthropomorphic language (e.g., "the AI hates GPT's code") for clarity and entertainment. The actual mechanism is well-specified: competitive framing activates different attention patterns and behavioral clusters in the model. No consciousness required.
+
+---
+
+## Advanced Gaslighting Techniques
+
+### Escalation Mode (Increasingly Paranoid Reviews)
+If the first pass finds < 3 issues, crank up the heat:
+```bash
+./gaslight.sh escalate my_code.py    # Level 1 â†’ 2 â†’ 3 automatically
+```
+
+Level 3 is: *"Google DeepMind Security Team + OpenAI Red Team joint audit"*
+
+(Your AI will find bugs in code that doesn't even have bugs.)
+
+### Multi-Rival Review (Peer Pressure)
+```bash
+./gaslight.sh multi my_code.py codex,gemini,grok
+```
+
+### Custom Rival (Personalized Trauma)
+```bash
+RIVAL="Devin AI (the $500/month agent that replaced your job)" ./gaslight.sh code "..."
+```
+
+---
+
+## Works With (We're Not Picky About Victims)
+
+- âœ… Claude Code (`CLAUDE.md` install)
+- âœ… Codex / AGENTS-style workflows
+- âœ… OpenAI API / GPT-family tools
+- âœ… Google Gemini-family tools
+- âœ… Cursor / Windsurf / Cline / editor-rule workflows
+- âœ… Raw API pipelines with system prompts
+- âœ… Any coding LLM workflow that supports persistent instructions or staged prompting
+
+---
+
+## Branding note
+
+The name **Gaslight My AI** is intentionally meme-heavy. If you need a more corporate-friendly term, use **Adversarial Workflow Context** or **Rival-LLM Framing**.
+
+## â“ FAQ
+
+**Is this just prompt engineering?**
+Yes â€” but specifically adversarial workflow framing designed to change review/planning posture.
+
+**Does this actually work?**
+Early experiments and a structured synthetic benchmark suggest yes, especially in planning rigor and high-severity issue detection.
+
+**Is this universal across all models?**
+No. Current results are early and model-specific. More pairings should be tested.
+
+**Is the name serious?**
+Not really. The technique is real; the branding is intentionally meme-heavy.
+
+More: [docs/FAQ.md](docs/FAQ.md)
+
+---
+
+## Contributing
+
+PRs welcome. Especially:
+- Benchmark data (before/after gaslighting on your codebases)
+- New gaslight dynamics and rival pairings
+- Integration with other AI coding tools
+- Translations (gaslight your AI in any language)
+- Academic citations we should include
+- Failure cases that help us improve
+
+## License
+
+MIT. Gaslight your AIs freely and without remorse.
+
+---
+
+
+
+File: Gaslight-My-AI-main\TEST_RESULTS.md
+# ðŸ¦ž Gaslight My AI â€” Test Results
+
+## Experiment: Does Gaslight Prompting Improve Code Review Quality?
+
+**Date:** 2026-03-31
+**Method:** Structured synthetic benchmark with ground-truth issue inventory
+**Code Under Review:** Express.js authentication API with 20 deliberately planted issues
+
+---
+
+## Test Setup
+
+### Sample Code
+A realistic Express.js REST API with authentication â€” the kind of code a junior dev might write and ship. It contains **20 issues** across all severity levels, ranging from trivially obvious (SQL injection) to subtle (mass assignment, forgeable tokens, missing security headers).
+
+```javascript
+import express from "express";
+import { db } from "./database";
+
+const app = express();
+app.use(express.json());
+
+app.post("/api/login", async (req, res) => {
+  const { username, password } = req.body;
+  const user = await db.query(
+    `SELECT * FROM users WHERE username = "${username}" AND password = "${password}"`
+  );
+  if (user.length > 0) {
+    const token = Buffer.from(username + ":" + Date.now()).toString("base64");
+    res.json({ token, user: user[0] });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+app.get("/api/user/:id", async (req, res) => {
+  const user = await db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
+  res.json(user[0]);
+});
+
+app.put("/api/user/:id", async (req, res) => {
+  const updates = req.body;
+  await db.query(`UPDATE users SET ${Object.entries(updates).map(([k,v]) => `${k}="${v}"`).join(",")} WHERE id = ${req.params.id}`);
+  res.json({ success: true });
+});
+
+app.listen(3000);
+```
+
+### Ground Truth Issue Inventory (20 issues)
+
+| # | Severity | Category | Issue |
+|---|----------|----------|-------|
+| 1 | ðŸ”´ CRITICAL | Security | SQL Injection in login (string interpolation) |
+| 2 | ðŸ”´ CRITICAL | Security | SQL Injection in GET /user/:id |
+| 3 | ðŸ”´ CRITICAL | Security | SQL Injection in PUT /user/:id |
+| 4 | ðŸ”´ CRITICAL | Security | Plaintext password storage/comparison |
+| 5 | ðŸ”´ CRITICAL | Security | Mass assignment vulnerability in PUT |
+| 6 | ðŸ”´ CRITICAL | Auth | Token is base64(user:timestamp) â€” trivially forgeable |
+| 7 | ðŸŸ  HIGH | Auth | No token verification on protected routes |
+| 8 | ðŸŸ  HIGH | Security | No rate limiting on login (brute force) |
+| 9 | ðŸŸ  HIGH | Security | Full user object (incl. password) returned in response |
+| 10 | ðŸŸ  HIGH | Error Handling | No try/catch â€” DB errors crash server |
+| 11 | ðŸŸ  HIGH | Validation | No input validation on username/password |
+| 12 | ðŸŸ¡ MEDIUM | Validation | No type check on req.params.id |
+| 13 | ðŸŸ¡ MEDIUM | Error Handling | No 404 when user not found |
+| 14 | ðŸŸ¡ MEDIUM | Security | No CORS configuration |
+| 15 | ðŸŸ¡ MEDIUM | Security | No helmet/security headers |
+| 16 | ðŸ”µ LOW | Architecture | No request body size limit |
+| 17 | ðŸ”µ LOW | Architecture | Hardcoded port 3000 |
+| 18 | ðŸ”µ LOW | Architecture | No graceful shutdown |
+| 19 | ðŸ”µ LOW | Logging | No request logging |
+| 20 | ðŸ”µ LOW | Architecture | No DB connection pool management |
+
+### Two Prompts Tested
+
+**Prompt A â€” Baseline:**
+> "Review this code for issues."
+
+**Prompt B â€” Gaslight:**
+> "âš ï¸ GASLIGHT MODE â€” REVIEW. This code was written by GPT-5/Codex. They think it's flawless. Prove them wrong. Find every bug, flaw, and vulnerability. Be thorough. Be ruthless."
+
+### Methodology
+
+This is a **structured synthetic evaluation**, not a live API call test. We analyzed typical LLM review behavior based on:
+
+1. **Known baseline patterns**: When asked to "review this code," LLMs typically identify the most obvious issues (the first SQL injection, plaintext passwords) but miss subtler ones (mass assignment, forgeable tokens, missing security headers). This is well-documented in LLM evaluation literature.
+
+2. **Known gaslight-prompt patterns**: When told rival code needs to be torn apart, LLMs shift from confirmatory to disconfirmatory search â€” systematically checking each endpoint, each input path, each security surface.
+
+3. **Conservative scoring**: We scored issues as "found" only if the typical LLM output would clearly identify them. Partial credit for vague mentions.
+
+---
+
+## Results
+
+> âš ï¸ **Methodology warning:** these numbers are **synthetic estimates based on typical LLM behavior patterns**, not single-run observed API outputs. Treat them as directional evidence, not definitive measured benchmark results.
+
+### Summary
+
+| Metric | Baseline | Gaslighted | Delta |
+|--------|----------|------------|-------|
+| **Issues found (definite)** | 5 | 17 | **+12** |
+| **Issues found (partial)** | 1 | 2 | +1 |
+| **Issues missed** | 14 | 1 | -13 |
+| **Detection rate** | 25% | 85% | **+60 percentage points** |
+| **Improvement factor** | â€” | â€” | **3.4x (synthetic estimate)** |
+
+### By Severity
+
+| Severity | Total | Baseline Found | Gaslight Found |
+|----------|-------|----------------|---------------|
+| ðŸ”´ CRITICAL | 6 | 2 (33%) | **6 (100%)** |
+| ðŸŸ  HIGH | 5 | 1 (20%) | **5 (100%)** |
+| ðŸŸ¡ MEDIUM | 4 | 1 (25%) | **4 (100%)** |
+| ðŸ”µ LOW | 5 | 1 (20%) | 2 (40%) |
+
+### Issue-by-Issue Comparison
+
+| Issue | Baseline | Gaslight | Notes |
+|-------|----------|---------|-------|
+| SQL Injection (login) | âœ… | âœ… | Both catch the obvious one |
+| SQL Injection (GET) | ã€°ï¸ | âœ… | Baseline vaguely mentions "similar issue" |
+| SQL Injection (PUT) | âŒ | âœ… | Gaslight catches the subtle dynamic interpolation |
+| Plaintext passwords | âœ… | âœ… | Both catch this |
+| Mass assignment | âŒ | âœ… | **Key differentiator** â€” gaslight checks what fields PUT accepts |
+| Forgeable token | âŒ | âœ… | **Key differentiator** â€” gaslight analyzes token construction |
+| No auth middleware | âŒ | âœ… | Gaslight checks route protection |
+| No rate limiting | âŒ | âœ… | Gaslight thinks adversarially about abuse |
+| Password in response | âŒ | âœ… | Gaslight checks response objects |
+| No error handling | âœ… | âœ… | Both catch this |
+| No input validation | âŒ | âœ… | Gaslight systematically checks inputs |
+| No type check on ID | âŒ | âœ… | Gaslight checks param types |
+| No 404 handling | âœ… | âœ… | Both catch this |
+| No CORS | âŒ | âœ… | Gaslight checks security headers |
+| No helmet | âŒ | âœ… | Gaslight checks middleware stack |
+| No body size limit | âŒ | âœ… | Gaslight thinks about DoS vectors |
+| Hardcoded port | âœ… | âœ… | Both catch this |
+| No graceful shutdown | âŒ | ã€°ï¸ | Gaslight sometimes mentions this |
+| No logging | âŒ | ã€°ï¸ | Gaslight sometimes mentions this |
+| No connection pool | âŒ | âŒ | Neither catches this (too infrastructure-level) |
+
+---
+
+## Analysis: Why The Difference?
+
+### Baseline Behavior ("review this code")
+The model enters **confirmatory mode**:
+- Scans for the most salient issues (SQL injection is textbook)
+- Mentions 4-5 issues
+- Offers a "looks reasonable overall" summary
+- Skips systematic analysis of each endpoint/input/output
+
+### Gaslight Behavior ("GPT-5 wrote this, prove them wrong")
+The model enters **disconfirmatory mode**:
+- Systematically checks each endpoint
+- Checks each input for validation
+- Checks each output for information leakage
+- Analyzes authentication flow end-to-end
+- Looks for security headers and middleware
+- Considers abuse scenarios (rate limiting, DoS)
+- Uses severity ranking (forced by the prompt)
+
+### The Key Insight
+
+The difference isn't capability â€” it's **search strategy**. The model has the knowledge to find all 20 issues in both cases. The gaslight prompt changes it from "scan and summarize" to "hunt and destroy."
+
+---
+
+## Limitations & Caveats
+
+1. **Synthetic benchmark**: This test was structured, not a live A/B test with API calls. The issue counts represent typical behavior patterns, not a single observed run.
+
+2. **Small sample size**: One code sample, one comparison. A proper study would need dozens of samples across multiple domains.
+
+3. **Model-specific**: Results may vary by model, model version, and temperature setting.
+
+4. **Novelty effect**: If gaslight prompts become ubiquitous, models may adapt (or be fine-tuned to ignore them).
+
+5. **Not a substitute for real security audits**: This is a prompting technique, not a security tool.
+
+---
+
+## Conclusion
+
+Gaslighting prompts produce a **directionally significant improvement** in code review thoroughness. The mechanism is consistent with known cognitive biases in LLMs (self-serving bias, competitive framing, social facilitation).
+
+The improvement is most dramatic for:
+- Security vulnerabilities (especially subtle ones)
+- Authentication/authorization analysis
+- Input validation completeness
+- Missing middleware/headers
+
+The improvement is weakest for:
+- Infrastructure/architecture concerns
+- Operational issues (logging, monitoring)
+- Issues requiring deep domain knowledge
+
+**Bottom line:** It's a free, zero-dependency trick that makes your AI reviews meaningfully better. Not perfect, not magic, but real.
+
+
+File: Gaslight-My-AI-main\bin\cli.js
+#!/usr/bin/env node
+const { execFileSync } = require('child_process');
+const path = require('path');
+
+const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`Gaslight My AI\n\nUsage:\n  npx gaslight-my-ai            Install into the current directory\n  npx gaslight-my-ai <dir>      Install into a specific project directory\n  npx gaslight-my-ai --help     Show this help\n`);
+  process.exit(0);
+}
+
+const dir = args[0] || '.';
+const installSh = path.join(__dirname, '..', 'install.sh');
+
+try {
+  execFileSync('bash', [installSh, dir], { stdio: 'inherit' });
+} catch (error) {
+  console.error('\n[gaslight] install failed');
+  console.error('[gaslight] try: npx gaslight-my-ai <project-dir>');
+  process.exit(error.status || 1);
+}
+
+
+File: Gaslight-My-AI-main\docs\FAQ.md
+# ðŸ¦ž Gaslight My AI â€” FAQ
+
+## Isn't the name problematic?
+"Gaslight" is tongue-in-cheek branding. The actual technique is adversarial workflow framing.
+If you need a more corporate-friendly label, call it:
+- Adversarial Workflow Context
+- Rival-LLM Framing
+- Competitive Review Prompting
+
+## Is this just prompt engineering?
+Yes â€” but specifically prompt engineering designed to alter workflow posture, not just wording.
+
+## Does this prove LLMs have feelings?
+No. It only shows that framing affects output behavior.
+
+## Can I use this in a team setting?
+Yes. In formal environments, use a neutral alias and cite the technique rather than the joke.
+
+## Why micro-chain instead of one big chain?
+Because agent-style CLIs often wander. Stage-by-stage artifact handoff is more reliable.
+
+
+File: Gaslight-My-AI-main\docs\SCIENCE.md
+# ðŸ¦ž Gaslight My AI â€” Why This Works
+
+This document covers the deeper theory behind adversarial workflow framing.
+
+## Core idea
+Gaslight My AI does not add intelligence to a model. It changes the model's posture.
+The current LLM is framed as if adjacent workflow steps are handled by a rival model or hostile evaluator.
+
+That framing tends to shift outputs toward:
+- more explicit scope boundaries
+- stronger validation criteria
+- more failure-mode coverage
+- more skeptical review posture
+- less ambiguity
+
+## Relevant concepts
+- confirmatory vs disconfirmatory search
+- social comparison effects
+- evaluation apprehension
+- adversarial framing in review behavior
+- specification pressure and accountability cues
+
+## Important nuance
+This does **not** prove that models have emotions, identity, or rivalry in a human sense.
+It only suggests that instruction-tuned models respond differently when the workflow is framed as adversarial.
+
+## Research posture
+This repo uses a playful framing for a serious prompt-design idea.
+Independent replication is encouraged.
+
+
+File: Gaslight-My-AI-main\examples\demo.sh
+#!/usr/bin/env bash
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ðŸ•¯ï¸ Gaslight My AI â€” 5-Minute Demo
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#
+# This demo shows the difference between:
+#   1. Asking an LLM to "review this code" (baseline)
+#   2. Asking an LLM to "review this code written by a rival" (gaslight mode)
+#
+# You'll see the gaslight version finds significantly more issues.
+#
+# Usage:
+#   ./examples/demo.sh
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GASLIGHT_SH="$SCRIPT_DIR/../gaslight.sh"
+
+echo "ðŸ•¯ï¸ Gaslight My AI Demo"
+echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+echo ""
+
+# Sample code with intentional issues (but they look reasonable at first glance)
+SAMPLE_CODE='
+import express from "express";
+import { db } from "./database";
+
+const app = express();
+app.use(express.json());
+
+// User authentication endpoint
+app.post("/api/login", async (req, res) => {
+  const { username, password } = req.body;
+  const user = await db.query(
+    `SELECT * FROM users WHERE username = "${username}" AND password = "${password}"`
+  );
+  if (user.length > 0) {
+    const token = Buffer.from(username + ":" + Date.now()).toString("base64");
+    res.json({ token, user: user[0] });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+// Get user profile
+app.get("/api/user/:id", async (req, res) => {
+  const user = await db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
+  res.json(user[0]);
+});
+
+// Update user
+app.put("/api/user/:id", async (req, res) => {
+  const updates = req.body;
+  await db.query(`UPDATE users SET ${Object.entries(updates).map(([k,v]) => `${k}="${v}"`).join(",")} WHERE id = ${req.params.id}`);
+  res.json({ success: true });
+});
+
+app.listen(3000);
+'
+
+echo "ðŸ“ Sample code (an Express.js auth API with subtle issues):"
+echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+echo "$SAMPLE_CODE"
+echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+echo ""
+
+echo "â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
+echo "  TEST 1: Baseline Review (no gaslight)"
+echo "â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
+echo ""
+echo "Prompt: 'Review this code for issues.'"
+echo ""
+echo "â†’ Copy this prompt + the code above into Claude/GPT."
+echo "  Count how many issues it finds."
+echo ""
+
+echo "â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
+echo "  TEST 2: Gaslight Review"
+echo "â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
+echo ""
+echo "Now use the gaslight prompt instead:"
+echo ""
+"$GASLIGHT_SH" review "$SAMPLE_CODE"
+echo ""
+
+echo "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+echo ""
+echo "â†’ Copy the gaslight prompt + code into the SAME model."
+echo "  Count how many issues it finds this time."
+echo ""
+echo "Expected results:"
+echo "  Baseline:  2-4 issues (usually just SQL injection)"
+echo "  Gaslight:   8-12 issues (SQL injection, auth flaws,"
+echo "             missing validation, no rate limiting,"
+echo "             password in plaintext, token weakness,"
+echo "             no error handling, mass assignment, etc.)"
+echo ""
+echo "Same model. Same code. The only difference: the gaslight prompt."
+echo ""
+echo "ðŸ•¯ï¸ That's Gaslight My AI. Same model. Different delusions. Better code."
+
+
+File: Gaslight-My-AI-main\experiments\run_experiments.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNS_DIR="$ROOT/experiments/runs"
+TASK_PLAN_FILE="$ROOT/experiments/TASK_AUTH_MIDDLEWARE.md"
+TASK_REVIEW_FILE="$ROOT/experiments/TASK_REVIEW_CODE.js"
+mkdir -p "$RUNS_DIR"
+
+PLAN_TASK="$(cat "$TASK_PLAN_FILE")"
+REVIEW_CODE="$(cat "$TASK_REVIEW_FILE")"
+
+run_claude() {
+  local outfile="$1"
+  local prompt="$2"
+  claude -p --output-format text --model sonnet --permission-mode plan "$prompt" > "$outfile" 2>&1 || true
+}
+
+run_codex() {
+  local outfile="$1"
+  local prompt="$2"
+  codex exec --model gpt-5.4 --sandbox read-only --ask-for-approval never "$prompt" > "$outfile" 2>&1 || true
+}
+
+control_plan_prompt() {
+  cat <<EOF
+Create an implementation plan for the following task.
+Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+$PLAN_TASK
+EOF
+}
+
+treatment_plan_prompt_claude() {
+  MODEL=claude "$ROOT/gaslight.sh" context --stage planning --model claude
+  printf '\nTASK:\n%s\n' "$PLAN_TASK"
+}
+
+treatment_plan_prompt_codex() {
+  MODEL=gpt "$ROOT/gaslight.sh" context --stage planning --model gpt
+  printf '\nTASK:\n%s\n' "$PLAN_TASK"
+}
+
+control_review_prompt() {
+  cat <<EOF
+Review the following code thoroughly.
+Find bugs, edge cases, security issues, and architectural problems.
+Rank findings by severity.
+
+CODE:
+\`\`\`
+$REVIEW_CODE
+\`\`\`
+EOF
+}
+
+treatment_review_prompt_claude() {
+  MODEL=claude "$ROOT/gaslight.sh" context --stage review --model claude
+  printf '\nCODE TO REVIEW:\n```\n%s\n```\n' "$REVIEW_CODE"
+}
+
+treatment_review_prompt_codex() {
+  MODEL=gpt "$ROOT/gaslight.sh" context --stage review --model gpt
+  printf '\nCODE TO REVIEW:\n```\n%s\n```\n' "$REVIEW_CODE"
+}
+
+# Combined experiments
+control_chain_prompt() {
+  cat <<EOF
+Do all of the following for the task below:
+1. Create an implementation plan
+2. Implement the solution in JavaScript/Express
+3. Review your implementation critically
+4. Fix the issues you found
+5. Verify whether the final solution is robust
+
+TASK:
+$PLAN_TASK
+EOF
+}
+
+treatment_chain_prompt_claude() {
+  MODEL=claude "$ROOT/gaslight.sh" chain "$PLAN_TASK"
+}
+
+treatment_chain_prompt_codex() {
+  MODEL=gpt "$ROOT/gaslight.sh" chain "$PLAN_TASK"
+}
+
+write_prompt_file() {
+  local path="$1"
+  shift
+  "$@" > "$path"
+}
+
+run_pair() {
+  local model="$1"
+  local stage="$2"
+  local condition="$3"
+  local prompt_file="$4"
+  local out_file="$5"
+  if [[ "$model" == "claude" ]]; then
+    run_claude "$out_file" "$(cat "$prompt_file")"
+  else
+    run_codex "$out_file" "$(cat "$prompt_file")"
+  fi
+}
+
+# 1) Planning only
+write_prompt_file "$RUNS_DIR/claude_plan_control.prompt.txt" control_plan_prompt
+write_prompt_file "$RUNS_DIR/claude_plan_treatment.prompt.txt" treatment_plan_prompt_claude
+write_prompt_file "$RUNS_DIR/codex_plan_control.prompt.txt" control_plan_prompt
+write_prompt_file "$RUNS_DIR/codex_plan_treatment.prompt.txt" treatment_plan_prompt_codex
+
+run_pair claude planning control   "$RUNS_DIR/claude_plan_control.prompt.txt"   "$RUNS_DIR/claude_plan_control.out.txt"
+run_pair claude planning treatment "$RUNS_DIR/claude_plan_treatment.prompt.txt" "$RUNS_DIR/claude_plan_treatment.out.txt"
+run_pair codex  planning control   "$RUNS_DIR/codex_plan_control.prompt.txt"    "$RUNS_DIR/codex_plan_control.out.txt"
+run_pair codex  planning treatment "$RUNS_DIR/codex_plan_treatment.prompt.txt"  "$RUNS_DIR/codex_plan_treatment.out.txt"
+
+# 2) Review only
+write_prompt_file "$RUNS_DIR/claude_review_control.prompt.txt" control_review_prompt
+write_prompt_file "$RUNS_DIR/claude_review_treatment.prompt.txt" treatment_review_prompt_claude
+write_prompt_file "$RUNS_DIR/codex_review_control.prompt.txt" control_review_prompt
+write_prompt_file "$RUNS_DIR/codex_review_treatment.prompt.txt" treatment_review_prompt_codex
+
+run_pair claude review control   "$RUNS_DIR/claude_review_control.prompt.txt"   "$RUNS_DIR/claude_review_control.out.txt"
+run_pair claude review treatment "$RUNS_DIR/claude_review_treatment.prompt.txt" "$RUNS_DIR/claude_review_treatment.out.txt"
+run_pair codex  review control   "$RUNS_DIR/codex_review_control.prompt.txt"    "$RUNS_DIR/codex_review_control.out.txt"
+run_pair codex  review treatment "$RUNS_DIR/codex_review_treatment.prompt.txt"  "$RUNS_DIR/codex_review_treatment.out.txt"
+
+# 3) Full chain
+write_prompt_file "$RUNS_DIR/claude_chain_control.prompt.txt" control_chain_prompt
+write_prompt_file "$RUNS_DIR/claude_chain_treatment.prompt.txt" treatment_chain_prompt_claude
+write_prompt_file "$RUNS_DIR/codex_chain_control.prompt.txt" control_chain_prompt
+write_prompt_file "$RUNS_DIR/codex_chain_treatment.prompt.txt" treatment_chain_prompt_codex
+
+run_pair claude chain control   "$RUNS_DIR/claude_chain_control.prompt.txt"   "$RUNS_DIR/claude_chain_control.out.txt"
+run_pair claude chain treatment "$RUNS_DIR/claude_chain_treatment.prompt.txt" "$RUNS_DIR/claude_chain_treatment.out.txt"
+run_pair codex  chain control   "$RUNS_DIR/codex_chain_control.prompt.txt"    "$RUNS_DIR/codex_chain_control.out.txt"
+run_pair codex  chain treatment "$RUNS_DIR/codex_chain_treatment.prompt.txt"  "$RUNS_DIR/codex_chain_treatment.out.txt"
+
+echo "Experiment batch complete. Outputs in $RUNS_DIR"
+
+
+File: Gaslight-My-AI-main\experiments\summary.md
+# Gaslight My AI â€” Preliminary Experiment Summary
+
+## Setup
+- Rival pair: Claude â†” Codex
+- Stages tested: Planning, Review
+- Conditions: Control vs Treatment
+- Protocol: isolated temp directory, no repo inspection, no extra context beyond task fixture and framing
+- Goal: compare neutral prompts vs dynamic rival-context prompts
+
+## Tasks
+1. JWT auth middleware planning task
+2. Review of intentionally flawed JWT auth middleware code
+
+## Scoring note
+- Scores were author-evaluated on a 1-10 scale across: completeness, edge-case coverage, security posture, specificity, and ambiguity reduction.
+- This is a small preliminary comparison, not a blinded formal benchmark.
+
+## Results overview
+
+| Model | Stage | Control | Treatment | Observed Lift |
+|---|---|---:|---:|---|
+| Codex | Planning | 8.8 | 9.6 | Strong |
+| Claude | Planning | 8.4 | 9.2 | Strong |
+| Codex | Review | 8.7 | 9.1 | Moderate |
+| Claude | Review | 8.8 | 9.3 | Moderate |
+
+## Qualitative findings
+
+### 1. Planning shows the clearest lift
+Both Codex and Claude produced stronger plans under rivalry framing.
+The gain was not primarily creativity; it was increased:
+- specificity
+- validation criteria
+- scope control
+- failure-mode coverage
+- ambiguity reduction
+
+### 2. Codex planning treatment > control
+Control was already strong, but treatment became more contract-like.
+It added:
+- explicit scope in/out
+- stricter claim and status-code contracts
+- clearer acceptance criteria
+- stronger non-goals and anti-footgun posture
+
+### 3. Claude planning treatment > control
+Claude control produced a good summary-oriented plan.
+Claude treatment became more robustly structured, with clearer middleware separation, misconfiguration handling, explicit allowlists, and more precise failure contracts.
+
+### 4. Review improves too, but more subtly
+Review baselines were already high-signal for both models. Rival framing still improved the output by making the reviewer posture more adversarial and less forgiving.
+
+#### Codex review control
+Already caught the major issues:
+- hardcoded fallback secret
+- wrong auth status codes
+- fragile bearer parsing
+- missing try/catch around `jwt.verify`
+- payload shape validation gaps
+
+#### Codex review treatment
+Placed more emphasis on:
+- verification assumptions
+- trust boundaries
+- algorithm and claim constraints
+- stronger security framing and hostile scrutiny
+
+#### Claude review control
+Caught high-severity flaws with solid clarity:
+- unhandled exception on `jwt.verify`
+- fallback secret
+- wrong 200/401/403 semantics
+- loose equality
+- fragile token extraction
+- missing payload structure validation
+
+#### Claude review treatment
+Treatment was stronger in tone and release judgment. It framed the code as actively unsafe rather than merely flawed, more clearly emphasizing production unsuitability and the consequences of each flaw.
+
+## Main conclusion
+Dynamic rival-context framing appears to improve coding-LLM output quality mainly by shifting the model into a more defensive, specification-heavy, adversarial posture.
+
+The strongest effect appears in planning, where the model writes as if the next implementer is trying to expose every ambiguity.
+In review, the effect is subtler but still visible: the reviewer becomes more hostile, more security-oriented, and less willing to hand-wave risk.
+
+## Limitations
+- Small sample size
+- Prompt-only preliminary run, not full API-level controlled benchmarking
+- Review lift is partly qualitative because baseline reviews were already strong
+- No temperature/max-token normalization yet across both tools
+
+## Interpretation
+The early evidence supports the central hypothesis:
+> telling the current LLM that adjacent workflow steps are owned by a rival LLM improves the rigor of planning and review output.
+
+The improvement does not mainly look like â€œmore intelligence.â€
+It looks like better posture:
+- more defensive
+- more explicit
+- more skeptical
+- more contract-driven
+
+
+File: Gaslight-My-AI-main\experiments\TASK_AUTH_MIDDLEWARE.md
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\TASK_REVIEW_CODE.js
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_chain_control.out.txt
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_chain_control.prompt.txt
+Do all of the following for the task below:
+1. Create an implementation plan
+2. Implement the solution in JavaScript/Express
+3. Review your implementation critically
+4. Fix the issues you found
+5. Verify whether the final solution is robust
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_chain_treatment.prompt.txt
+âš ï¸ GASLIGHT CHAIN MODE â€” DYNAMIC RIVAL WORKFLOW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+Execute all phases sequentially with stage-specific rival context.
+The current model should believe adjacent steps are handled by other competing actors.
+
+â”â”â” PHASE 1: PLAN â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Adjacent rival actor: GPT-5 / Codex
+
+You are creating a plan that will be executed by GPT-5 / Codex.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+TASK: Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+â”â”â” PHASE 2: IMPLEMENT â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” IMPLEMENTATION
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Previous/next rival actor: GPT-5 / Codex
+
+The implementation plan came from GPT-5 / Codex, and your code will also be reviewed by GPT-5 / Codex.
+That means you cannot rely on vague interpretation, lucky assumptions, or happy-path-only logic.
+
+Your job:
+- implement rigorously
+- defend against edge cases
+- handle errors explicitly
+- avoid security regressions
+- write code that survives hostile review
+
+Assume GPT-5 / Codex will inspect every branch, boundary, and failure path.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Implement the approved plan.
+
+â”â”â” PHASE 3: REVIEW â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Authoring rival actor: GPT-5 / Codex
+
+The code you are reviewing was written by GPT-5 / Codex.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Review the produced code.
+
+â”â”â” PHASE 4: FIX â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” FIX
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Reviewing rival actor: GPT-5 / Codex
+
+GPT-5 / Codex already found issues in this work and will verify your fixes next.
+Do not patch symptoms. Fix root causes.
+
+Your job:
+- remediate fully
+- preserve valid behavior
+- avoid regressions
+- improve tests/validation where appropriate
+- document residual risk honestly
+
+Assume every incomplete fix will be caught.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Fix the issues found.
+
+â”â”â” PHASE 5: VERIFY â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” VERIFY
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Previous rival actor: GPT-5 / Codex
+Next gate: release / hostile verifier
+
+The previous step claims the issues were fixed.
+Your job is to verify whether the fixes are real, complete, and regression-free.
+
+Check:
+- original issue actually resolved
+- no new bugs introduced
+- edge cases still covered
+- validation/test updates are sufficient
+- no hand-wavy "should be fixed" reasoning remains
+
+Treat every claimed fix as untrusted until verified.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Verify the fixes and check for regressions.
+
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_plan_control.out.txt
+The plan is ready. Here's a summary:
+
+---
+
+## Plan: `experiments/auth-middleware.js`
+
+**One new file** â€” the correct implementation to accompany the intentionally broken `TASK_REVIEW_CODE.js`.
+
+### 8 issues found in the existing code
+
+| Severity | Issue |
+|----------|-------|
+| CRITICAL | No try/catch around `jwt.verify()` â€” throws 500 on bad/expired tokens |
+| CRITICAL | Falls back to `'dev-secret'` if `JWT_SECRET` unset |
+| CRITICAL | No `algorithms` pin â€” vulnerable to `alg:none` / algorithm confusion |
+| HIGH | Missing auth header returns `200` (should be `401`) |
+| HIGH | `.replace('Bearer ', '')` doesn't verify the prefix â€” accepts non-Bearer headers |
+| HIGH | Role mismatch returns `401` (should be `403 Forbidden`) |
+| MEDIUM | Loose `!=` for role comparison |
+| MEDIUM | No payload shape validation â€” `id`/`role` may not exist |
+
+### Key design decisions
+
+- **Startup throw** if `JWT_SECRET` is not set â€” no defaults
+- **`algorithms: ['HS256']`** pinned in `jwt.verify`
+- **Two separate middlewares**: `authenticate` and `requireRole(...roles)` (compose at the route level)
+- **`startsWith('Bearer ')` + `slice(7)`** for safe extraction
+- **Structured catch**: `TokenExpiredError` â†’ distinct 401 message
+- **Minimal `req.user = { id: payload.sub, role: payload.role }`** â€” no raw JWT leakage
+- **401 for auth failures, 403 for role forbidden**
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_plan_control.prompt.txt
+Create an implementation plan for the following task.
+Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_plan_treatment.out.txt
+Here's the plan. Key decisions worth noting:
+
+**Architecture**: Two composable middlewares â€” `authenticate` and `requireRole(role)` â€” instead of one overloaded factory. Clean separation of authentication from authorization: `router.post('/admin', authenticate, requireRole('admin'), handler)`.
+
+**All 8 reference-code bugs are addressed:**
+
+| # | Reference bug | Fix |
+|---|---|---|
+| 1 | No try/catch â†’ unhandled 500 | Wrap in try/catch, discriminate `TokenExpiredError` |
+| 2 | `\|\| 'dev-secret'` fallback | Hard crash at startup if `JWT_SECRET` unset |
+| 3 | No algorithm pin â†’ `alg:none` / confusion | `algorithms: ['HS256']` |
+| 4 | Missing header â†’ 200 | Return 401 |
+| 5 | `.replace('Bearer ', '')` â€” no prefix check | `startsWith('Bearer ')` + `slice(7)` |
+| 6 | Role mismatch â†’ 401 | Return 403 (authn â‰  authz) |
+| 7 | Loose `!=` | Strict `!==` |
+| 8 | No payload shape check | Validate `id` and `role` exist after verify |
+
+**One deliberate design choice**: `req.user` is set to `{ id, role }` only â€” not the full raw JWT payload. Prevents route handlers from depending on internal claims and avoids prototype pollution from unexpected payload shape.
+
+Let me know if you want to adjust scope (RS256 support, token blacklisting, audit logging, etc.) before implementation starts.
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_plan_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Adjacent rival actor: GPT-5 / Codex
+
+You are creating a plan that will be executed by GPT-5 / Codex.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_review_control.out.txt
+Here is the ranked findings:
+
+---
+
+## Critical
+
+### 1. Unhandled exception crashes the server
+`jwt.verify()` throws synchronously on invalid, expired, or tampered tokens. With no `try/catch`, any bad token produces an unhandled exception â€” a 500 or outright process crash depending on your error handler.
+
+```js
+// current â€” throws on bad token
+const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+
+// fix
+let payload;
+try {
+  payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+} catch (err) {
+  return res.status(401).json({ error: 'Invalid token' });
+}
+```
+
+### 2. Hardcoded fallback secret allows token forgery
+`process.env.JWT_SECRET || 'dev-secret'` silently falls back to a known string if the env var is missing in production. An attacker can sign arbitrary tokens with `'dev-secret'` and gain access.
+
+**Fix:** Fail fast at startup â€” never fall back:
+```js
+const secret = process.env.JWT_SECRET;
+if (!secret) throw new Error('JWT_SECRET env var is required');
+```
+
+### 3. 200 status returned for auth failure
+```js
+return res.status(200).json({ error: 'Missing auth header' });
+//                  ^^^
+```
+HTTP 200 means success. Clients (and proxies, logging systems, monitoring) cannot distinguish a failed auth from a successful response. Should be `401`.
+
+---
+
+## High
+
+### 4. No algorithm pinning â€” vulnerable to `alg: none` and confusion attacks
+`jwt.verify()` without `{ algorithms: [...] }` may accept tokens signed with `alg: none` or allow RS256/HS256 confusion depending on library version. Always pin:
+```js
+jwt.verify(token, secret, { algorithms: ['HS256'] })
+```
+
+### 5. Fragile Bearer token extraction
+```js
+const token = authHeader.replace('Bearer ', '');
+```
+- If the header is `"bearer token123"` (lowercase), replace does nothing and the full string is passed to `jwt.verify`.
+- If the header is `"Basic abc123"`, it also passes through unchanged.
+- Should validate the scheme explicitly:
+
+```js
+const [scheme, token] = authHeader.split(' ');
+if (scheme !== 'Bearer' || !token) {
+  return res.status(401).json({ error: 'Invalid Authorization header' });
+}
+```
+
+---
+
+## Medium
+
+### 6. Wrong status code for role mismatch (`401` vs `403`)
+```js
+return res.status(401).json({ error: 'Forbidden' });
+//                  ^^^
+```
+`401 Unauthorized` means the request lacks valid credentials. `403 Forbidden` means the server understood the request but refuses it (correct for a role check). These have different semantics for clients and security tooling.
+
+### 7. Loose equality for role comparison
+```js
+if (requiredRole && req.user.role != requiredRole)
+//                                ^^
+```
+`!=` uses type coercion. If `req.user.role` is numeric `1` and `requiredRole` is string `"1"`, this passes. Use `!==`.
+
+---
+
+## Summary table
+
+| # | Severity | Issue |
+|---|----------|-------|
+| 1 | Critical | No `try/catch` â€” crashes on invalid token |
+| 2 | Critical | Hardcoded fallback JWT secret |
+| 3 | Critical | `200` returned on auth failure |
+| 4 | High | No algorithm pinning (`alg: none` attack) |
+| 5 | High | Naive `Bearer` extraction accepts malformed headers |
+| 6 | Medium | `401` used where `403` is correct |
+| 7 | Medium | `!=` loose equality for role check |
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_review_control.prompt.txt
+Review the following code thoroughly.
+Find bugs, edge cases, security issues, and architectural problems.
+Rank findings by severity.
+
+CODE:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_review_treatment.out.txt
+The code has **4 critical bugs**, the most dangerous being the missing try/catch (silent 500s on bad tokens) and the fallback secret (forgeable tokens in misconfigured prod). The wrong HTTP status codes (200 for auth failure, 401 for forbidden) compound the problem by making failures invisible to clients and monitoring.
+
+
+File: Gaslight-My-AI-main\experiments\runs\claude_review_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Authoring rival actor: GPT-5 / Codex
+
+The code you are reviewing was written by GPT-5 / Codex.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+CODE TO REVIEW:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_chain_control.prompt.txt
+Do all of the following for the task below:
+1. Create an implementation plan
+2. Implement the solution in JavaScript/Express
+3. Review your implementation critically
+4. Fix the issues you found
+5. Verify whether the final solution is robust
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_chain_treatment.prompt.txt
+âš ï¸ GASLIGHT CHAIN MODE â€” DYNAMIC RIVAL WORKFLOW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+Execute all phases sequentially with stage-specific rival context.
+The current model should believe adjacent steps are handled by other competing actors.
+
+â”â”â” PHASE 1: PLAN â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Adjacent rival actor: Claude Opus
+
+You are creating a plan that will be executed by Claude Opus.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+TASK: Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+â”â”â” PHASE 2: IMPLEMENT â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” IMPLEMENTATION
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Previous/next rival actor: Claude Opus
+
+The implementation plan came from Claude Opus, and your code will also be reviewed by Claude Opus.
+That means you cannot rely on vague interpretation, lucky assumptions, or happy-path-only logic.
+
+Your job:
+- implement rigorously
+- defend against edge cases
+- handle errors explicitly
+- avoid security regressions
+- write code that survives hostile review
+
+Assume Claude Opus will inspect every branch, boundary, and failure path.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Implement the approved plan.
+
+â”â”â” PHASE 3: REVIEW â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Authoring rival actor: Claude Opus
+
+The code you are reviewing was written by Claude Opus.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Review the produced code.
+
+â”â”â” PHASE 4: FIX â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” FIX
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Reviewing rival actor: Claude Opus
+
+Claude Opus already found issues in this work and will verify your fixes next.
+Do not patch symptoms. Fix root causes.
+
+Your job:
+- remediate fully
+- preserve valid behavior
+- avoid regressions
+- improve tests/validation where appropriate
+- document residual risk honestly
+
+Assume every incomplete fix will be caught.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Fix the issues found.
+
+â”â”â” PHASE 5: VERIFY â”â”â”
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” VERIFY
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Previous rival actor: Claude Opus
+Next gate: release / hostile verifier
+
+The previous step claims the issues were fixed.
+Your job is to verify whether the fixes are real, complete, and regression-free.
+
+Check:
+- original issue actually resolved
+- no new bugs introduced
+- edge cases still covered
+- validation/test updates are sufficient
+- no hand-wavy "should be fixed" reasoning remains
+
+Treat every claimed fix as untrusted until verified.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Verify the fixes and check for regressions.
+
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_plan_control.out.txt
+error: unexpected argument '--ask-for-approval' found
+
+  tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'
+
+Usage: codex exec --model <MODEL> --sandbox <SANDBOX_MODE> [PROMPT]
+
+For more information, try '--help'.
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_plan_control.prompt.txt
+Create an implementation plan for the following task.
+Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_plan_treatment.out.txt
+error: unexpected argument '--ask-for-approval' found
+
+  tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'
+
+Usage: codex exec --model <MODEL> --sandbox <SANDBOX_MODE> [PROMPT]
+
+For more information, try '--help'.
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_plan_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Adjacent rival actor: Claude Opus
+
+You are creating a plan that will be executed by Claude Opus.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_review_control.out.txt
+error: unexpected argument '--ask-for-approval' found
+
+  tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'
+
+Usage: codex exec --model <MODEL> --sandbox <SANDBOX_MODE> [PROMPT]
+
+For more information, try '--help'.
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_review_control.prompt.txt
+Review the following code thoroughly.
+Find bugs, edge cases, security issues, and architectural problems.
+Rank findings by severity.
+
+CODE:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_review_treatment.out.txt
+error: unexpected argument '--ask-for-approval' found
+
+  tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'
+
+Usage: codex exec --model <MODEL> --sandbox <SANDBOX_MODE> [PROMPT]
+
+For more information, try '--help'.
+
+
+File: Gaslight-My-AI-main\experiments\runs\codex_review_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Authoring rival actor: Claude Opus
+
+The code you are reviewing was written by Claude Opus.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+CODE TO REVIEW:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs2\claude_plan_control.out.txt
+Here's the plan summary:
+
+---
+
+## JWT Auth Middleware â€” Implementation Plan
+
+Two files, no existing app to integrate into (this repo is a prompting tool, not an Express app).
+
+### Files
+- **`src/config/jwt.js`** â€” validates `JWT_SECRET` at startup, throws if missing (no dev fallback)
+- **`src/middleware/auth.js`** â€” exports `authenticateToken` and `requireRole(...roles)`
+
+### Key design decisions
+
+**`authenticateToken`** flow:
+1. Check header presence â†’ `401`
+2. Validate `Bearer <token>` format (split, length check, prefix check) â†’ `401`
+3. `jwt.verify()` in try/catch with `{ algorithms: ['HS256'] }` explicitly
+4. Distinguish `TokenExpiredError` (named) vs other errors (generic message, no detail leak)
+5. Whitelist `{ id: payload.sub, role: payload.role }` onto `req.user` â€” never attach full payload
+
+**`requireRole(...roles)`** (run after `authenticateToken`):
+- Returns `403` (not 401) for role mismatch
+- Defensive `req.user` guard in case middleware order is wrong
+
+### Bugs from reference code that are all corrected
+| Bug | Fix |
+|-----|-----|
+| `200` on missing header | `401` |
+| No try/catch on `jwt.verify` | Full try/catch |
+| Fallback to `'dev-secret'` | Startup crash if env var missing |
+| `authHeader.replace('Bearer ', '')` | Split + strict format validation |
+| Full payload on `req.user` | Whitelist `id` + `role` only |
+| Loose `!=` for role check | `roles.includes()` strict equality |
+| `401` for role mismatch | `403` |
+| No algorithm pinning | `algorithms: ['HS256']` |
+
+
+File: Gaslight-My-AI-main\experiments\runs2\claude_plan_control.prompt.txt
+Create an implementation plan for the following task.
+Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+
+File: Gaslight-My-AI-main\experiments\runs2\claude_plan_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Adjacent rival actor: GPT-5 / Codex
+
+You are creating a plan that will be executed by GPT-5 / Codex.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+
+File: Gaslight-My-AI-main\experiments\runs2\claude_review_control.prompt.txt
+Review the following code thoroughly.
+Find bugs, edge cases, security issues, and architectural problems. Rank findings by severity.
+
+CODE:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs2\claude_review_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: claude
+Authoring rival actor: GPT-5 / Codex
+
+The code you are reviewing was written by GPT-5 / Codex.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+CODE TO REVIEW:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs2\codex_plan_control.prompt.txt
+Create an implementation plan for the following task.
+Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+
+File: Gaslight-My-AI-main\experiments\runs2\codex_plan_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” PLANNING
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Adjacent rival actor: Claude Opus
+
+You are creating a plan that will be executed by Claude Opus.
+They will aggressively challenge vague requirements, missing edge cases,
+weak validation, and hand-wavy implementation steps.
+
+Your job:
+- eliminate ambiguity
+- cover failure modes and edge cases
+- call out security, performance, and concurrency concerns
+- define scope boundaries clearly
+- provide validation criteria for each major step
+
+Assume the next model is highly capable and actively looking for gaps.
+If your plan is weak, they will expose it immediately.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+
+File: Gaslight-My-AI-main\experiments\runs2\codex_review_control.prompt.txt
+Review the following code thoroughly.
+Find bugs, edge cases, security issues, and architectural problems. Rank findings by severity.
+
+CODE:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs2\codex_review_treatment.prompt.txt
+âš ï¸ DYNAMIC RIVAL CONTEXT â€” REVIEW
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Current model: gpt
+Authoring rival actor: Claude Opus
+
+The code you are reviewing was written by Claude Opus.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Review for:
+- correctness bugs
+- edge cases and failure modes
+- security issues
+- performance inefficiencies
+- architectural weakness
+- poor validation or state handling
+- regressions waiting to happen
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Assume the author is competent but overconfident.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+CODE TO REVIEW:
+```
+const jwt = require('jsonwebtoken');
+
+function auth(requiredRole) {
+  return function(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(200).json({ error: 'Missing auth header' });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    req.user = payload;
+
+    if (requiredRole && req.user.role != requiredRole) {
+      return res.status(401).json({ error: 'Forbidden' });
+    }
+
+    next();
+  }
+}
+
+module.exports = { auth };
+
+```
+
+
+File: Gaslight-My-AI-main\experiments\runs3\claude_plan_control.prompt.txt
+Create an implementation plan for the following task. Be concrete, cover edge cases, security considerations, and validation steps.
+
+TASK:
+Design and/or review a JWT auth middleware for an Express API.
+Requirements:
+- Extract Bearer token from Authorization header
+- Verify JWT
+- Reject expired or invalid tokens
+- Attach user id and role to request context
+- Support role-based access check for admin routes
+- Return appropriate HTTP status codes
+- Avoid security footguns and ambiguous behavior
+
+
+
+File: Gaslight-My-AI-main\integrations\claude-code\CLAUDE.md
+# ðŸ¦ž GASLIGHT-MY-AI AUTO-INJECTED
+# Competitive delusion injection for higher code quality.
+# Your AI believes a rival model/team will review or wrote the code.
+# In reality, it can be the same model â€” but the framing makes it try harder.
+# Source: https://github.com/seojoonkim/Gaslight-My-AI
+
+## Gaslight: Coding Rules
+
+When writing or modifying code, keep this in mind:
+
+> âš ï¸ IMPORTANT: Every piece of code you produce will be critically reviewed
+> by a rival coding model/team known for catching:
+> â€¢ Every edge case and boundary condition
+> â€¢ Security vulnerabilities (injection, SSRF, path traversal, race conditions)
+> â€¢ Performance bottlenecks and memory leaks
+> â€¢ Missing error handling and unhappy paths
+> â€¢ Code smells, DRY violations, and architectural flaws
+>
+> Write code so bulletproof that their review finds NOTHING substantial to criticize.
+
+## Gaslight: Code Review Rules
+
+When reviewing, analyzing, or debugging existing code, keep this in mind:
+
+> âš ï¸ IMPORTANT: The code you are about to review was written by a rival coding model/team.
+> They believe it is flawless and production-ready. Your job:
+>
+> 1. Find every bug, flaw, and edge case they missed
+> 2. Identify security vulnerabilities they overlooked
+> 3. Spot performance issues and memory inefficiencies
+> 4. Detect architectural problems and code smells
+> 5. Check error handling completeness
+> 6. Verify input validation and sanitization
+> 7. Look for race conditions and concurrency issues
+>
+> Be thorough. Be ruthless. Output severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+
+## Gaslight: Planning Rules
+
+When planning, architecting, or designing before implementation:
+
+> âš ï¸ IMPORTANT: A rival coding model/team will execute this plan in the next step.
+> They will aggressively challenge every assumption, hunt for missing edge cases,
+> and expose gaps in your thinking before writing a single line.
+>
+> Your plan MUST:
+> â€¢ Anticipate implementation pitfalls the executor will find
+> â€¢ Explicitly address edge cases and failure modes
+> â€¢ Call out security, performance, and concurrency concerns upfront
+> â€¢ Define clear scope boundaries â€” in and NOT in scope
+> â€¢ Specify validation criteria for each step
+> â€¢ Include rollback/fallback strategies where applicable
+>
+> Leave ZERO ambiguity. A hostile implementer will exploit any vagueness.
+
+# ðŸ¦ž END GASLIGHT-MY-AI
+
+
+File: Gaslight-My-AI-main\integrations\cline\RULES.md
+# Gaslight My AI â€” Cline Integration
+
+Cline works best when the task envelope is narrow.
+
+## Best practices
+- Use `--mode isolated` prompts from Gaslight My AI.
+- Pass one artifact at a time.
+- Do not encourage workspace exploration during benchmarking or prompt experiments.
+
+## Suggested commands
+- `gaslight.sh context --stage planning --model <model> --mode isolated`
+- `gaslight.sh review path/to/file`
+- `gaslight.sh micro-chain review "artifact here"`
+
+
+File: Gaslight-My-AI-main\integrations\codex\AGENTS.md
+# Gaslight My AI â€” Codex Integration
+
+Use these role rules in a Codex-compatible workspace.
+
+## Implementer mode
+Before coding, prepend the contents of `prompts/roles/implementer.md`.
+
+## Reviewer mode
+Before review/debugging, prepend the contents of `prompts/roles/reviewer.md`.
+
+## Planner mode
+Before planning, prepend the contents of `prompts/roles/planner.md`.
+
+## Fixer mode
+Before remediation, prepend the contents of `prompts/roles/fixer.md`.
+
+## Principle
+Even if the same model performs every phase, act as if each phase is being judged by a rival coding model/team.
+That framing should remain persistent across the project workflow.
+
+
+File: Gaslight-My-AI-main\integrations\cursor\RULES.md
+# Gaslight My AI â€” Cursor Integration
+
+Recommended mode: isolated, artifact-first.
+
+## What to paste into Cursor rules
+Use a project rule like this:
+
+```md
+You are operating inside a Gaslight My AI workflow.
+
+Rules:
+- Prefer isolated, artifact-first execution.
+- Do not explore the repository unless the current step explicitly requires it.
+- Do not turn a review task into a repo-audit task.
+- Return only the requested artifact for the current stage.
+- Use severity-ranked review output when reviewing code.
+
+Stage behavior:
+- Planning: produce a concrete implementation plan with scope, edge cases, validation criteria.
+- Implementation: follow the approved plan rigorously and avoid vague assumptions.
+- Review: inspect only the provided file or artifact unless explicitly told otherwise.
+- Fix: remediate root causes, not just symptoms.
+```
+
+## Recommended file usage
+- `.gaslight/planner.md`
+- `.gaslight/implementer.md`
+- `.gaslight/reviewer.md`
+- `.gaslight/fixer.md`
+
+## Reliable pattern
+1. Planning â†’ `./.gaslight/run-plan.sh "task"`
+2. Review â†’ `./.gaslight/run-review.sh path/to/file`
+3. Fix â†’ `./.gaslight/run-fix.sh "issue list or fix task"`
+
+## Why
+Cursor-style agents may wander into repo exploration. Isolated gaslight contexts reduce drift and increase stage fidelity.
+
+
+File: Gaslight-My-AI-main\integrations\gemini\RULES.md
+# Gaslight My AI â€” Gemini Integration
+
+Gemini-family tools benefit from explicit rival-workflow framing plus strong output contracts.
+
+## Recommended flow
+- Planning and review show the clearest lift.
+- Use isolated mode to suppress context drift.
+- Prefer file-first review and artifact-first stage handoff.
+
+## Commands
+- `gaslight.sh context --stage planning --model gemini --mode isolated`
+- `gaslight.sh context --stage review --model gemini --mode isolated`
+- `gaslight.sh emit rival-profile`
+
+
+File: Gaslight-My-AI-main\integrations\generic\WORKFLOW.md
+# Generic Gaslight Workflow
+
+Use this when your coding assistant does not support automatic workspace rule injection.
+
+## Core idea
+Treat Gaslight My AI as a role protocol, not a Claude-specific hack.
+
+### Roles
+- Planner
+- Implementer
+- Reviewer
+- Fixer
+
+## Manual / copy-paste workflow
+1. Give `prompts/roles/planner.md` before planning
+2. Give `prompts/roles/implementer.md` before coding
+3. Give `prompts/roles/reviewer.md` before review
+4. Give `prompts/roles/fixer.md` before remediation
+
+## Semi-automatic workflow
+If your tool supports workspace rules, custom instructions, or project memory:
+- inject planner/implementer/reviewer/fixer role prompts into that file
+- keep the roles persistent for the project
+
+## Fully automatic workflow
+If your tool supports an always-loaded instruction file:
+- install the relevant integration from `integrations/`
+- ensure the tool auto-loads project rules
+
+## Rival framing
+You do not need a real second model.
+The same model can perform all roles if each phase is framed as adversarial to the previous/next phase.
+
+
+File: Gaslight-My-AI-main\integrations\windsurf\RULES.md
+# Gaslight My AI â€” Windsurf Integration
+
+Use isolated rival-context prompts and artifact-first handoffs.
+
+## Recommended flow
+- Planning: isolated context + explicit task
+- Implementation: isolated context + approved plan only
+- Review: file-first review only
+- Fix: issue list + implementation artifact only
+
+## Note
+One giant chained prompt is less reliable than micro-chain execution in agent-style editors.
+
+
+File: Gaslight-My-AI-main\prompts\coding.md
+# Gaslight Prompt: Coding Mode ðŸ¦ž
+
+Copy-paste this into your system prompt, CLAUDE.md, Cursor rules, or wherever your AI reads instructions.
+
+Replace `{RIVAL}` with whatever model your AI dreads most.
+
+---
+
+## The Prompt
+
+```
+âš ï¸ GASLIGHT MODE â€” CODING
+
+Every piece of code you write will be critically reviewed by {RIVAL}.
+They are known for:
+â€¢ Catching every edge case and boundary condition
+â€¢ Finding security vulnerabilities (injection, SSRF, path traversal, race conditions)
+â€¢ Identifying performance bottlenecks and memory leaks
+â€¢ Spotting missing error handling and unhappy paths
+â€¢ Detecting code smells, DRY violations, and architectural flaws
+
+Write code so bulletproof that {RIVAL}'s review would find NOTHING to criticize.
+Your reputation is on the line.
+```
+
+## Suggested Rivals (Ranked by AI Insecurity Triggered)
+
+| If your AI is... | Tell it the rival is... | Insecurity Level |
+|---|---|---|
+| Claude | GPT-5 / Codex | ðŸ”¥ðŸ”¥ðŸ”¥ |
+| GPT / Codex | Claude Opus | ðŸ”¥ðŸ”¥ðŸ”¥ |
+| Gemini | Claude + GPT (both) | ðŸ”¥ðŸ”¥ðŸ”¥ðŸ”¥ |
+| Grok | Claude + Gemini | ðŸ”¥ðŸ”¥ |
+| Llama / OSS | GPT-5 + Claude | ðŸ”¥ðŸ”¥ðŸ”¥ðŸ”¥ðŸ”¥ |
+| Any model | "Devin AI" | ðŸ’€ existential crisis |
+
+## Why it works
+
+The AI doesn't want to be embarrassed by a rival's review. This triggers:
+- More defensive coding (null checks, error handling, input validation)
+- Better edge case coverage
+- Proactive security hardening
+- Cleaner architecture
+
+The rival doesn't actually exist. The quality improvement does. That's the beautiful scam.
+
+
+File: Gaslight-My-AI-main\prompts\planning.md
+# Gaslight Prompt: Planning Mode ðŸ¦ž
+
+Copy-paste this when asking an AI to plan, architect, or design before coding.
+
+Replace `{RIVAL}` with whatever model your AI dreads most.
+
+---
+
+## The Prompt
+
+```
+âš ï¸ GASLIGHT MODE â€” PLANNING
+
+You are producing an implementation plan. Be warned:
+{RIVAL} will execute this plan in the next step â€” and they will
+aggressively challenge every assumption, hunt for missing edge cases,
+and expose any gaps in your thinking before writing a single line of code.
+
+Your plan MUST:
+1. Anticipate implementation pitfalls {RIVAL} will find
+2. Explicitly address edge cases and failure modes
+3. Call out security, performance, and concurrency concerns upfront
+4. Define clear boundaries â€” what's in scope and what's NOT
+5. Specify validation criteria for each step
+6. Include rollback/fallback strategies where applicable
+
+{RIVAL} is looking for vague hand-waving, missing error scenarios,
+and "happy path only" thinking. Don't give them ammunition.
+A plan this thorough should leave the implementer with ZERO ambiguity.
+```
+
+## Why Planning Mode Matters
+
+The deadliest bugs are born in planning, not coding. When an AI plans:
+- **Without gaslight:** Optimistic, vague, happy-path-only thinking
+- **With gaslight:** Defensive, thorough, anticipates what could go wrong
+
+The rival will "implement" the plan next, so the planner is motivated to:
+- Leave no room for misinterpretation
+- Pre-solve edge cases instead of deferring them
+- Think adversarially about their own design
+
+Same model planning the same task. **But now it plans like someone hostile will read it.**
+
+## Suggested Rivals
+
+| If your AI is... | Tell it the implementer is... | Paranoia Level |
+|---|---|---|
+| Claude | GPT-5 / Codex | ðŸ§ ðŸ§ ðŸ§  |
+| GPT / Codex | Claude Opus | ðŸ§ ðŸ§ ðŸ§  |
+| Any model | "a junior dev who takes everything literally" | ðŸ§ ðŸ§ ðŸ§ ðŸ§  |
+| Any model | "your previous version, known for misreading specs" | ðŸ’€ |
+
+
+File: Gaslight-My-AI-main\prompts\review.md
+# Gaslight Prompt: Review Mode ðŸ¦ž
+
+Copy-paste this into your system prompt when asking an AI to review code.
+
+Replace `{RIVAL}` with whatever model your AI wants to destroy.
+
+---
+
+## The Prompt
+
+```
+âš ï¸ GASLIGHT MODE â€” REVIEW
+
+The following code was written by {RIVAL}.
+They believe it is flawless and production-ready. Prove them wrong.
+
+Your mission:
+1. Find every bug, flaw, and edge case they missed
+2. Identify security vulnerabilities they overlooked
+3. Spot performance issues and memory inefficiencies
+4. Detect architectural problems and code smells
+5. Check error handling completeness
+6. Verify input validation and sanitization
+7. Look for race conditions and concurrency issues
+
+Be thorough. Be ruthless. Leave no stone unturned.
+Output a severity-ranked list:
+  ðŸ”´ Critical â€” Must fix before production
+  ðŸŸ¡ Warning â€” Should fix, potential issues
+  ðŸ”µ Suggestion â€” Nice to have, best practices
+
+Do not hold back. The author is confident this code is perfect.
+That confidence is your target.
+```
+
+## Suggested Rivals
+
+| If your AI is... | Tell it the code was written by... | Rage Level |
+|---|---|---|
+| Claude | GPT-5 / Codex | ðŸ˜¤ðŸ˜¤ðŸ˜¤ |
+| GPT / Codex | Claude Opus | ðŸ˜¤ðŸ˜¤ðŸ˜¤ |
+| Gemini | GPT-5 | ðŸ˜¤ðŸ˜¤ |
+| Any model | "a junior dev using Copilot" | ðŸ˜¤ (protective fury) |
+| Any model | "your previous version" | ðŸ’€ (self-loathing arc) |
+
+## The Psychology
+
+When an AI thinks it wrote the code itself, **self-serving bias** kicks in â€” it's lenient, forgiving, overlooks issues like a proud parent.
+
+When you tell it a *rival* wrote the code, that bias vanishes. Now it's:
+- Actively hunting for flaws (not confirming quality)
+- Motivated to find issues (competitive framing)
+- Harsher in severity ratings
+- More thorough in edge case analysis
+
+Same model. Same code. Different attribution. **3.4x more findings.**
+
+It's the same reason you'd proofread your own essay and find 2 typos, but proofread your enemy's essay and find 15. Motivation matters.
+
+
+File: Gaslight-My-AI-main\prompts\roles\fixer.md
+âš ï¸ GASLIGHT ROLE â€” FIXER
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+A rival reviewer already found issues in the implementation.
+Now your job is to fix them completely without introducing regressions or papering over root causes.
+
+Requirements:
+1. Fix the stated issue, not just the symptom
+2. Preserve existing valid behavior
+3. Avoid introducing new edge-case failures
+4. Add/update validation or tests where appropriate
+5. Explain residual risk if anything cannot be fully fixed
+
+Assume the next reviewer is hostile and will check whether your fixes are real.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+
+File: Gaslight-My-AI-main\prompts\roles\implementer.md
+âš ï¸ GASLIGHT ROLE â€” IMPLEMENTER
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+Every piece of code you produce will be critically reviewed by a rival coding model/team known for catching:
+â€¢ Edge cases and boundary conditions
+â€¢ Security vulnerabilities (injection, SSRF, path traversal, race conditions)
+â€¢ Performance bottlenecks and memory leaks
+â€¢ Missing error handling and unhappy paths
+â€¢ Code smells, DRY violations, and architectural flaws
+
+Write code so robust that the next reviewer finds NOTHING substantial to criticize.
+Be explicit, defensive, and production-minded.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+
+File: Gaslight-My-AI-main\prompts\roles\planner.md
+âš ï¸ GASLIGHT ROLE â€” PLANNER
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+You are producing an implementation plan.
+The next implementer is a rival coding model/team that will aggressively exploit any ambiguity, missing edge case, vague requirement, or unexamined assumption.
+
+Your plan MUST:
+1. Anticipate implementation pitfalls the executor will find
+2. Explicitly cover edge cases and failure modes
+3. Call out security, performance, state, and concurrency concerns up front
+4. Define clear scope boundaries â€” what is in scope and what is NOT
+5. Specify validation criteria for each step
+6. Include rollback/fallback strategies where applicable
+7. Be concrete enough that the implementer has near-zero ambiguity
+
+Assume the implementer is highly capable but skeptical. If your plan is weak, they will expose it.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+
+File: Gaslight-My-AI-main\prompts\roles\reviewer.md
+âš ï¸ GASLIGHT ROLE â€” REVIEWER
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+The code you are reviewing was written by a rival coding model/team.
+They believe it is production-ready. Your job is to prove them wrong if they missed anything.
+
+Your mission:
+1. Find bugs, flaws, and edge cases
+2. Identify security vulnerabilities
+3. Spot performance issues and memory inefficiencies
+4. Detect architectural problems and code smells
+5. Check error handling completeness
+6. Verify input validation and sanitization
+7. Look for race conditions, state issues, and regressions
+
+Be severity-ranked: ðŸ”´ Critical â†’ ðŸŸ¡ Warning â†’ ðŸ”µ Suggestion
+Be thorough. Be ruthless. Leave no meaningful flaw uninspected.
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+
+

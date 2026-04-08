@@ -1,0 +1,1651 @@
+Folder: jdcodes1_claude-sh_src
+Content root: C:\Users\s616279\Documents\ClaudeThings\jdcodes1_claude-sh_src\jdcodes1-claude-sh-1a06abe
+
+.gitignore
+
+.env
+.env.local
+*.log
+
+claude.sh
+
+#!/usr/bin/env bash
+#
+# claude.sh — Claude Code, rewritten as a bash script
+#
+# Dependencies: curl, jq
+# Optional: rg (ripgrep) for better grep
+#
+# Usage:
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#   ./claude.sh
+#
+# Environment:
+#   ANTHROPIC_API_KEY   — Required. Your Anthropic API key.
+#   CLAUDE_MODEL        — Model to use (default: claude-sonnet-4-20250514)
+#   CLAUDE_MAX_TOKENS   — Max output tokens (default: 8192)
+#   ANTHROPIC_API_URL   — API base URL (default: https://api.anthropic.com)
+#
+
+set -euo pipefail
+
+# ── Resolve script directory and source libs ──────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$SCRIPT_DIR/lib/tui.sh"
+source "$SCRIPT_DIR/lib/json.sh"
+source "$SCRIPT_DIR/lib/tools.sh"
+source "$SCRIPT_DIR/lib/api.sh"
+
+# ── Preflight checks ─────────────────────────────────────────
+preflight() {
+    local missing=()
+    command -v curl &>/dev/null || missing+=("curl")
+    command -v jq &>/dev/null   || missing+=("jq")
+
+    if (( ${#missing[@]} > 0 )); then
+        print_error "Missing required dependencies: ${missing[*]}"
+        echo "  Install with: brew install ${missing[*]}"
+        exit 1
+    fi
+
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        print_error "ANTHROPIC_API_KEY environment variable not set"
+        echo "  export ANTHROPIC_API_KEY=\"sk-ant-...\""
+        exit 1
+    fi
+
+    if ! command -v rg &>/dev/null; then
+        print_warning "ripgrep (rg) not found, falling back to grep for search"
+    fi
+}
+
+# ── Slash commands ────────────────────────────────────────────
+handle_command() {
+    local input="$1"
+
+    case "$input" in
+        /help)
+            printf '\n%bCommands:%b\n' "$BOLD" "$RESET"
+            printf '  %b/help%b      — Show this help\n' "$CYAN" "$RESET"
+            printf '  %b/cost%b      — Show session cost\n' "$CYAN" "$RESET"
+            printf '  %b/model%b     — Show/change model\n' "$CYAN" "$RESET"
+            printf '  %b/clear%b     — Clear conversation\n' "$CYAN" "$RESET"
+            printf '  %b/compact%b   — Compact message history\n' "$CYAN" "$RESET"
+            printf '  %b/save%b      — Save current session\n' "$CYAN" "$RESET"
+            printf '  %b/resume%b    — Resume a saved session\n' "$CYAN" "$RESET"
+            printf '  %b/commit%b    — Auto-generate a commit\n' "$CYAN" "$RESET"
+            printf '  %b/diff%b      — Show git diff\n' "$CYAN" "$RESET"
+            printf '  %b/quit%b      — Exit\n' "$CYAN" "$RESET"
+            printf '\n'
+            return 0
+            ;;
+        /cost)
+            local cost
+            cost=$(get_session_cost)
+            print_cost "$cost" "$TOTAL_INPUT_TOKENS" "$TOTAL_OUTPUT_TOKENS"
+            return 0
+            ;;
+        /model)
+            printf '%bCurrent model:%b %s\n' "$DIM" "$RESET" "${CLAUDE_MODEL:-claude-sonnet-4-20250514}"
+            printf '%bChange with:%b export CLAUDE_MODEL=<model>\n' "$DIM" "$RESET"
+            return 0
+            ;;
+        /model\ *)
+            CLAUDE_MODEL="${input#/model }"
+            print_success "Model set to: $CLAUDE_MODEL"
+            return 0
+            ;;
+        /clear)
+            echo '[]' > "$MESSAGES_FILE"
+            TURN_COUNT=0
+            print_success "Conversation cleared"
+            return 0
+            ;;
+        /compact)
+            maybe_compact_messages
+            return 0
+            ;;
+        /save)
+            save_session
+            print_success "Session saved: $SESSION_ID"
+            return 0
+            ;;
+        /resume)
+            list_sessions
+            return 0
+            ;;
+        /resume\ *)
+            resume_session "${input#/resume }"
+            return 0
+            ;;
+        /diff)
+            if git rev-parse --is-inside-work-tree &>/dev/null; then
+                git diff --stat
+                printf '\n'
+                git diff
+            else
+                print_warning "Not in a git repository"
+            fi
+            return 0
+            ;;
+        /commit)
+            if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+                print_warning "Not in a git repository"
+                return 0
+            fi
+            local diff_summary
+            diff_summary=$(git diff --cached --stat 2>/dev/null)
+            if [[ -z "$diff_summary" ]]; then
+                diff_summary=$(git diff --stat 2>/dev/null)
+                if [[ -z "$diff_summary" ]]; then
+                    print_warning "No changes to commit"
+                    return 0
+                fi
+                print_dim "  No staged changes. Staging all changes first..."
+                git add -A
+            fi
+            # Ask Claude to generate a commit message
+            process_turn "Look at the current git diff (use \`git diff --cached\`) and recent git log. Generate a concise commit message and run \`git commit -m '<message>'\`. Do NOT amend."
+            return 0
+            ;;
+        /quit|/exit|/q)
+            exit 0
+            ;;
+        /*)
+            print_warning "Unknown command: $input (try /help)"
+            return 0
+            ;;
+    esac
+
+    return 1  # Not a command
+}
+
+# ── Process one turn (may loop for tool_use) ──────────────────
+process_turn() {
+    local user_input="$1"
+
+    # Add user message
+    add_user_message "$user_input"
+
+    # Tool use loop
+    local max_tool_turns=25
+    local tool_turn=0
+
+    while true; do
+        # Maybe compact if history is getting long
+        maybe_compact_messages
+
+        # Build and send request
+        start_spinner
+        local request
+        request=$(build_request)
+        stream_request_with_retry "$request"
+        local stream_status=$?
+
+        if (( stream_status != 0 )); then
+            return 1
+        fi
+
+        # Track usage
+        update_usage "$RESPONSE_INPUT_TOKENS" "$RESPONSE_OUTPUT_TOKENS" \
+            "$RESPONSE_CACHE_READ" "$RESPONSE_CACHE_WRITE"
+
+        # Add assistant message to history
+        add_assistant_message "$RESPONSE_CONTENT_BLOCKS"
+
+        # Check if we need to execute tools
+        if [[ "$RESPONSE_STOP_REASON" != "tool_use" ]]; then
+            break
+        fi
+
+        tool_turn=$((tool_turn + 1))
+        if (( tool_turn >= max_tool_turns )); then
+            print_warning "Max tool turns ($max_tool_turns) reached"
+            break
+        fi
+
+        # Extract and execute tool_use blocks
+        local tool_count
+        tool_count=$(echo "$RESPONSE_CONTENT_BLOCKS" | jq '[.[] | select(.type == "tool_use")] | length')
+
+        if (( tool_count == 0 )); then
+            break
+        fi
+
+        printf '\n'
+
+        # Build tool results array
+        local tool_results="[]"
+        local i
+
+        for (( i = 0; i < tool_count; i++ )); do
+            local tool_block
+            tool_block=$(echo "$RESPONSE_CONTENT_BLOCKS" | jq -c "[.[] | select(.type == \"tool_use\")][$i]")
+
+            local tool_name tool_id tool_input
+            tool_name=$(echo "$tool_block" | jq -r '.name')
+            tool_id=$(echo "$tool_block" | jq -r '.id')
+            tool_input=$(echo "$tool_block" | jq -c '.input')
+
+            # Execute the tool
+            local result
+            result=$(execute_tool "$tool_name" "$tool_id" "$tool_input")
+
+            # Append to results array
+            tool_results=$(echo "$tool_results" | jq --argjson result "$result" '. += [$result]')
+        done
+
+        # Add tool results to conversation
+        add_tool_results "$tool_results"
+
+        printf '\n'
+    done
+
+    # Show per-turn cost
+    local turn_cost
+    turn_cost=$(awk "BEGIN { printf \"%.4f\", ($RESPONSE_INPUT_TOKENS * $PRICE_INPUT + $RESPONSE_OUTPUT_TOKENS * $PRICE_OUTPUT) / 1000000 }")
+    printf '%b  $%s · %s in / %s out%b\n' \
+        "$DIM" "$turn_cost" "$RESPONSE_INPUT_TOKENS" "$RESPONSE_OUTPUT_TOKENS" "$RESET"
+}
+
+# ── Main REPL ─────────────────────────────────────────────────
+main() {
+    preflight
+    init_session
+
+    # Handle --resume flag
+    if [[ "${1:-}" == "--resume" ]] && [[ -n "${2:-}" ]]; then
+        resume_session "$2"
+    fi
+
+    # Cleanup on exit
+    trap 'cleanup_tui; show_exit_summary; cleanup_session' EXIT
+    trap 'stop_spinner; printf "\n"' INT
+
+    print_banner
+
+    # Check for piped input (non-interactive mode)
+    if [[ ! -t 0 ]]; then
+        local piped_input
+        piped_input=$(cat)
+        if [[ -n "$piped_input" ]]; then
+            process_turn "$piped_input"
+        fi
+        return
+    fi
+
+    # Interactive REPL
+    while true; do
+        local user_input=""
+
+        # Read input (supports multiline with \)
+        print_prompt
+        if ! IFS= read -re user_input; then
+            # EOF (ctrl-d)
+            printf '\n'
+            break
+        fi
+
+        # Skip empty input
+        [[ -z "${user_input// /}" ]] && continue
+
+        # Add to readline history
+        history -s "$user_input"
+
+        # Handle slash commands
+        if [[ "$user_input" == /* ]]; then
+            if handle_command "$user_input"; then
+                continue
+            fi
+        fi
+
+        # Process the turn
+        process_turn "$user_input"
+        printf '\n'
+    done
+}
+
+show_exit_summary() {
+    if (( TURN_COUNT > 0 )); then
+        # Auto-save session
+        save_session 2>/dev/null
+        local cost
+        cost=$(get_session_cost)
+        printf '\n'
+        print_separator
+        print_cost "$cost" "$TOTAL_INPUT_TOKENS" "$TOTAL_OUTPUT_TOKENS"
+        printf '%b  %d turns | model: %s | session: %s%b\n' \
+            "$DIM" "$TURN_COUNT" "${CLAUDE_MODEL:-claude-sonnet-4-20250514}" "$SESSION_ID" "$RESET"
+        printf '%b  resume with: ./claude.sh --resume %s%b\n' "$DIM" "$SESSION_ID" "$RESET"
+    fi
+    printf '\n%bbye!%b\n' "$DIM" "$RESET"
+}
+
+# ── Entry point ───────────────────────────────────────────────
+main "$@"
+
+lib/api.sh
+
+#!/usr/bin/env bash
+# api.sh — Anthropic API client with SSE streaming via FIFO pipe
+
+MAX_RETRIES=3
+CONSECUTIVE_529=0
+
+# Stream a request with automatic retry on rate limits
+stream_request_with_retry() {
+    local request_body="$1"
+    local attempt=0
+    local delay=1
+
+    while (( attempt <= MAX_RETRIES )); do
+        stream_request "$request_body"
+        local status=$?
+
+        if (( status == 0 )); then
+            CONSECUTIVE_529=0
+            return 0
+        fi
+
+        # Check if it was a retryable error (rate limit)
+        if (( status == 2 )); then
+            attempt=$((attempt + 1))
+            if (( attempt > MAX_RETRIES )); then
+                print_error "Max retries ($MAX_RETRIES) exceeded"
+                return 1
+            fi
+            print_warning "Rate limited. Retrying in ${delay}s... (attempt $attempt/$MAX_RETRIES)"
+            sleep "$delay"
+            delay=$((delay * 2))
+            # Restart spinner for retry
+            start_spinner
+        else
+            return 1
+        fi
+    done
+    return 1
+}
+
+# Stream a request to the Claude API and process events in real-time
+# Returns: 0 on success, 1 on fatal error, 2 on retryable error (rate limit)
+stream_request() {
+    local request_body="$1"
+
+    # Reset response state
+    RESPONSE_CONTENT_BLOCKS="[]"
+    RESPONSE_STOP_REASON=""
+    RESPONSE_INPUT_TOKENS=0
+    RESPONSE_OUTPUT_TOKENS=0
+    RESPONSE_CACHE_READ=0
+    RESPONSE_CACHE_WRITE=0
+
+    # Temp files for accumulating state
+    local blocks_file="$SESSION_DIR/blocks.json"
+    local meta_file="$SESSION_DIR/meta.txt"
+    local text_accum_file="$SESSION_DIR/text_accum.txt"
+    local tool_json_file="$SESSION_DIR/tool_json_accum.txt"
+    local current_block_file="$SESSION_DIR/current_block.json"
+
+    echo '[]' > "$blocks_file"
+    : > "$meta_file"
+    : > "$text_accum_file"
+    : > "$tool_json_file"
+    : > "$current_block_file"
+
+    local api_key="${ANTHROPIC_API_KEY}"
+    local api_url="${ANTHROPIC_API_URL:-https://api.anthropic.com}"
+
+    if [[ -z "$api_key" ]]; then
+        print_error "ANTHROPIC_API_KEY not set"
+        return 1
+    fi
+
+    stop_spinner
+
+    # Create a FIFO for real-time streaming
+    local fifo="$SESSION_DIR/sse_fifo"
+    [[ -p "$fifo" ]] && rm -f "$fifo"
+    mkfifo "$fifo"
+
+    # Track curl's HTTP response code via a file
+    local http_code_file="$SESSION_DIR/http_code"
+    : > "$http_code_file"
+
+    # Launch curl in background, writing SSE stream to the FIFO
+    (
+        local code
+        code=$(curl -sS -w '%{http_code}' \
+            --no-buffer \
+            -o "$fifo" \
+            -X POST "${api_url}/v1/messages" \
+            -H "content-type: application/json" \
+            -H "x-api-key: ${api_key}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$request_body" 2>/dev/null)
+        echo "$code" > "$http_code_file"
+    ) &
+    local curl_pid=$!
+
+    # Parse SSE events from the FIFO in real-time
+    local current_event="" current_data=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+
+        if [[ "$line" == event:* ]]; then
+            current_event="${line#event: }"
+        elif [[ "$line" == data:* ]]; then
+            current_data="${line#data: }"
+        elif [[ -z "$line" ]] && [[ -n "$current_event" ]]; then
+            process_sse_event "$current_event" "$current_data" \
+                "$blocks_file" "$text_accum_file" "$tool_json_file" \
+                "$current_block_file" "$meta_file"
+            current_event=""
+            current_data=""
+        fi
+    done < "$fifo"
+
+    # Wait for curl to finish
+    wait "$curl_pid" 2>/dev/null
+
+    # Check HTTP status
+    local http_code
+    http_code=$(cat "$http_code_file" 2>/dev/null)
+
+    if [[ -n "$http_code" ]] && [[ "$http_code" != "200" ]] && [[ "$http_code" != "000" ]]; then
+        if [[ "$(cat "$blocks_file")" == "[]" ]]; then
+            rm -f "$fifo"
+            # Rate limit errors are retryable
+            if [[ "$http_code" == "429" ]] || [[ "$http_code" == "529" ]]; then
+                if [[ "$http_code" == "529" ]]; then
+                    CONSECUTIVE_529=$((CONSECUTIVE_529 + 1))
+                fi
+                return 2
+            fi
+            print_error "API returned HTTP $http_code"
+            return 1
+        fi
+    fi
+
+    rm -f "$fifo"
+
+    # Read final state
+    RESPONSE_CONTENT_BLOCKS=$(cat "$blocks_file")
+    RESPONSE_STOP_REASON=$(grep '^stop_reason=' "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2)
+    RESPONSE_INPUT_TOKENS=$(grep '^input_tokens=' "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2)
+    RESPONSE_OUTPUT_TOKENS=$(grep '^output_tokens=' "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2)
+    RESPONSE_CACHE_READ=$(grep '^cache_read=' "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2)
+    RESPONSE_CACHE_WRITE=$(grep '^cache_write=' "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2)
+
+    RESPONSE_INPUT_TOKENS=${RESPONSE_INPUT_TOKENS:-0}
+    RESPONSE_OUTPUT_TOKENS=${RESPONSE_OUTPUT_TOKENS:-0}
+    RESPONSE_CACHE_READ=${RESPONSE_CACHE_READ:-0}
+    RESPONSE_CACHE_WRITE=${RESPONSE_CACHE_WRITE:-0}
+    RESPONSE_STOP_REASON=${RESPONSE_STOP_REASON:-end_turn}
+
+    printf '\n'
+}
+
+# Process a single SSE event — called in real-time as events arrive
+process_sse_event() {
+    local event="$1" data="$2"
+    local blocks_file="$3" text_accum_file="$4" tool_json_file="$5"
+    local current_block_file="$6" meta_file="$7"
+
+    case "$event" in
+        message_start)
+            local input_tokens cache_read cache_write
+            input_tokens=$(echo "$data" | jq -r '.message.usage.input_tokens // 0' 2>/dev/null)
+            cache_read=$(echo "$data" | jq -r '.message.usage.cache_read_input_tokens // 0' 2>/dev/null)
+            cache_write=$(echo "$data" | jq -r '.message.usage.cache_creation_input_tokens // 0' 2>/dev/null)
+            {
+                echo "input_tokens=$input_tokens"
+                echo "cache_read=$cache_read"
+                echo "cache_write=$cache_write"
+            } >> "$meta_file"
+            ;;
+
+        content_block_start)
+            local block_type
+            block_type=$(echo "$data" | jq -r '.content_block.type // empty' 2>/dev/null)
+
+            if [[ "$block_type" == "text" ]]; then
+                : > "$text_accum_file"
+                echo "$data" | jq -c '.content_block' > "$current_block_file"
+            elif [[ "$block_type" == "tool_use" ]]; then
+                : > "$tool_json_file"
+                echo "$data" | jq -c '.content_block' > "$current_block_file"
+                # Show tool name as it starts
+                local tool_name
+                tool_name=$(echo "$data" | jq -r '.content_block.name // empty' 2>/dev/null)
+                if [[ -n "$tool_name" ]]; then
+                    printf '\n%b  [calling %s...]%b' "$DIM" "$tool_name" "$RESET"
+                fi
+            fi
+            ;;
+
+        content_block_delta)
+            local delta_type
+            delta_type=$(echo "$data" | jq -r '.delta.type // empty' 2>/dev/null)
+
+            if [[ "$delta_type" == "text_delta" ]]; then
+                local text
+                text=$(echo "$data" | jq -r '.delta.text // empty' 2>/dev/null)
+                # Print to terminal in real-time (this is the streaming magic)
+                printf '%s' "$text"
+                # Also accumulate for history
+                printf '%s' "$text" >> "$text_accum_file"
+            elif [[ "$delta_type" == "input_json_delta" ]]; then
+                local partial
+                partial=$(echo "$data" | jq -r '.delta.partial_json // empty' 2>/dev/null)
+                printf '%s' "$partial" >> "$tool_json_file"
+            fi
+            ;;
+
+        content_block_stop)
+            local block block_type
+            block=$(cat "$current_block_file")
+            block_type=$(echo "$block" | jq -r '.type // empty' 2>/dev/null)
+
+            if [[ "$block_type" == "text" ]]; then
+                local full_text text_escaped finalized
+                full_text=$(cat "$text_accum_file")
+                text_escaped=$(jq -Rs '.' <<< "$full_text")
+                finalized=$(echo "$block" | jq --argjson text "$text_escaped" '.text = $text')
+                jq --argjson block "$finalized" '. += [$block]' "$blocks_file" > "${blocks_file}.tmp" && \
+                    mv "${blocks_file}.tmp" "$blocks_file"
+
+            elif [[ "$block_type" == "tool_use" ]]; then
+                local tool_json parsed_input finalized
+                tool_json=$(cat "$tool_json_file")
+                parsed_input=$(echo "$tool_json" | jq -c '.' 2>/dev/null || echo '{}')
+                finalized=$(echo "$block" | jq --argjson input "$parsed_input" '.input = $input')
+                jq --argjson block "$finalized" '. += [$block]' "$blocks_file" > "${blocks_file}.tmp" && \
+                    mv "${blocks_file}.tmp" "$blocks_file"
+                printf '\n'
+            fi
+            ;;
+
+        message_delta)
+            local stop_reason output_tokens
+            stop_reason=$(echo "$data" | jq -r '.delta.stop_reason // empty' 2>/dev/null)
+            output_tokens=$(echo "$data" | jq -r '.usage.output_tokens // 0' 2>/dev/null)
+            {
+                echo "stop_reason=$stop_reason"
+                echo "output_tokens=$output_tokens"
+            } >> "$meta_file"
+            ;;
+
+        message_stop)
+            ;;
+
+        error)
+            local error_msg
+            error_msg=$(echo "$data" | jq -r '.error.message // .message // "Unknown error"' 2>/dev/null)
+            print_error "Stream error: $error_msg"
+            ;;
+    esac
+}
+
+lib/json.sh
+
+#!/usr/bin/env bash
+# json.sh — JSON/message construction helpers using jq
+
+# Session state
+SESSION_DIR=""
+MESSAGES_FILE=""
+SESSION_ID=""
+TOTAL_INPUT_TOKENS=0
+TOTAL_OUTPUT_TOKENS=0
+TOTAL_CACHE_READ=0
+TOTAL_CACHE_WRITE=0
+TURN_COUNT=0
+
+# Pricing (Sonnet 4)
+PRICE_INPUT=3.00    # per 1M tokens
+PRICE_OUTPUT=15.00  # per 1M tokens
+PRICE_CACHE_READ=0.30
+PRICE_CACHE_WRITE=3.75
+
+# Sessions directory
+SESSIONS_DIR="${HOME}/.claude-sh/sessions"
+
+init_session() {
+    SESSION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/claude-sh.XXXXXX")
+    MESSAGES_FILE="$SESSION_DIR/messages.json"
+    SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
+    echo '[]' > "$MESSAGES_FILE"
+    mkdir -p "$SESSIONS_DIR"
+}
+
+cleanup_session() {
+    [[ -d "$SESSION_DIR" ]] && rm -rf "$SESSION_DIR"
+}
+
+# Add a user message
+add_user_message() {
+    local text="$1"
+    local escaped
+    escaped=$(jq -Rs '.' <<< "$text")
+    jq --argjson content "$escaped" \
+        '. += [{"role": "user", "content": $content}]' \
+        "$MESSAGES_FILE" > "$SESSION_DIR/tmp.json" && \
+        mv "$SESSION_DIR/tmp.json" "$MESSAGES_FILE"
+    TURN_COUNT=$((TURN_COUNT + 1))
+}
+
+# Add an assistant message (full content blocks)
+add_assistant_message() {
+    local content_json="$1"
+    jq --argjson content "$content_json" \
+        '. += [{"role": "assistant", "content": $content}]' \
+        "$MESSAGES_FILE" > "$SESSION_DIR/tmp.json" && \
+        mv "$SESSION_DIR/tmp.json" "$MESSAGES_FILE"
+}
+
+# Add tool results as a user message
+add_tool_results() {
+    local results_json="$1"
+    jq --argjson content "$results_json" \
+        '. += [{"role": "user", "content": $content}]' \
+        "$MESSAGES_FILE" > "$SESSION_DIR/tmp.json" && \
+        mv "$SESSION_DIR/tmp.json" "$MESSAGES_FILE"
+}
+
+# Build the API request body
+build_request() {
+    local model="${CLAUDE_MODEL:-claude-sonnet-4-20250514}"
+    local max_tokens="${CLAUDE_MAX_TOKENS:-8192}"
+    local messages tools system_prompt
+
+    messages=$(cat "$MESSAGES_FILE")
+    tools=$(build_tools_json)
+    system_prompt=$(build_system_prompt)
+
+    jq -n \
+        --arg model "$model" \
+        --argjson max_tokens "$max_tokens" \
+        --argjson messages "$messages" \
+        --argjson tools "$tools" \
+        --arg system "$system_prompt" \
+        '{
+            model: $model,
+            max_tokens: $max_tokens,
+            messages: $messages,
+            tools: $tools,
+            system: $system,
+            stream: true
+        }'
+}
+
+build_system_prompt() {
+    local cwd
+    cwd=$(pwd)
+
+    # Start with base prompt
+    cat <<PROMPT
+You are claude.sh, a lightweight AI coding assistant running as a bash script.
+You have access to tools for reading, editing, and writing files, running bash commands, and searching codebases.
+
+Environment:
+- Working directory: $cwd
+- Platform: $(uname -s) $(uname -m)
+- Shell: ${SHELL:-bash}
+- Date: $(date +%Y-%m-%d)
+
+Guidelines:
+- Be concise and direct
+- Use tools to explore before making changes
+- Prefer simple solutions
+- When editing files, read them first
+PROMPT
+
+    # Load CLAUDE.md files (walk up from cwd to root)
+    local claude_md_content=""
+    claude_md_content=$(load_claude_md_files)
+    if [[ -n "$claude_md_content" ]]; then
+        printf '\n# Project Instructions\n\n%s' "$claude_md_content"
+    fi
+
+    # Git context
+    local git_context=""
+    git_context=$(get_git_context)
+    if [[ -n "$git_context" ]]; then
+        printf '\n# Git Context\n\n%s' "$git_context"
+    fi
+}
+
+# Walk up directory tree collecting CLAUDE.md files
+load_claude_md_files() {
+    local dir
+    dir=$(pwd)
+    local files=()
+
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/CLAUDE.md" ]]; then
+            files+=("$dir/CLAUDE.md")
+        fi
+        if [[ -f "$dir/.claude/CLAUDE.md" ]]; then
+            files+=("$dir/.claude/CLAUDE.md")
+        fi
+        dir=$(dirname "$dir")
+    done
+
+    # Also check home directory
+    if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+        files+=("$HOME/.claude/CLAUDE.md")
+    fi
+
+    # Print in reverse order (root first, most specific last)
+    local i
+    for (( i=${#files[@]}-1; i>=0; i-- )); do
+        local f="${files[$i]}"
+        printf '## From %s\n\n' "$f"
+        cat "$f"
+        printf '\n\n'
+    done
+}
+
+# Get git branch, status, recent commits
+get_git_context() {
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+
+    local branch
+    branch=$(git branch --show-current 2>/dev/null || echo "detached")
+
+    local status
+    status=$(git status --short 2>/dev/null | head -n 20)
+
+    local log
+    log=$(git log --oneline -5 2>/dev/null)
+
+    printf 'Branch: %s\n' "$branch"
+    if [[ -n "$status" ]]; then
+        printf '\nUncommitted changes:\n%s\n' "$status"
+    fi
+    if [[ -n "$log" ]]; then
+        printf '\nRecent commits:\n%s\n' "$log"
+    fi
+}
+
+# ── Session persistence ──────────────────────────────────────
+
+save_session() {
+    local session_file="$SESSIONS_DIR/${SESSION_ID}.json"
+    local cwd
+    cwd=$(pwd)
+
+    jq -n \
+        --arg id "$SESSION_ID" \
+        --arg cwd "$cwd" \
+        --arg model "${CLAUDE_MODEL:-claude-sonnet-4-20250514}" \
+        --argjson messages "$(cat "$MESSAGES_FILE")" \
+        --argjson input_tokens "$TOTAL_INPUT_TOKENS" \
+        --argjson output_tokens "$TOTAL_OUTPUT_TOKENS" \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson turns "$TURN_COUNT" \
+        '{
+            id: $id,
+            cwd: $cwd,
+            model: $model,
+            messages: $messages,
+            input_tokens: $input_tokens,
+            output_tokens: $output_tokens,
+            timestamp: $timestamp,
+            turns: $turns
+        }' > "$session_file"
+}
+
+list_sessions() {
+    if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls "$SESSIONS_DIR"/*.json 2>/dev/null)" ]]; then
+        print_dim "  No saved sessions"
+        return
+    fi
+
+    printf '\n%bSaved sessions:%b\n\n' "$BOLD" "$RESET"
+
+    local i=0
+    for f in $(ls -t "$SESSIONS_DIR"/*.json 2>/dev/null | head -n 10); do
+        local id cwd turns timestamp model
+        id=$(jq -r '.id' "$f")
+        cwd=$(jq -r '.cwd' "$f")
+        turns=$(jq -r '.turns' "$f")
+        timestamp=$(jq -r '.timestamp' "$f")
+        model=$(jq -r '.model' "$f")
+        i=$((i + 1))
+        printf '  %b%d)%b %s %b(%s turns, %s)%b\n' \
+            "$CYAN" "$i" "$RESET" "$id" "$DIM" "$turns" "$model" "$RESET"
+        printf '     %b%s%b\n' "$DIM" "$cwd" "$RESET"
+    done
+    printf '\n%bUsage:%b /resume <number> or /resume <id>\n\n' "$DIM" "$RESET"
+}
+
+resume_session() {
+    local target="$1"
+    local session_file=""
+
+    # If it's a number, pick by index
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        session_file=$(ls -t "$SESSIONS_DIR"/*.json 2>/dev/null | sed -n "${target}p")
+    else
+        # Match by ID prefix
+        session_file=$(ls "$SESSIONS_DIR"/${target}*.json 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$session_file" ]] || [[ ! -f "$session_file" ]]; then
+        print_error "Session not found: $target"
+        return 1
+    fi
+
+    local id cwd model turns
+    id=$(jq -r '.id' "$session_file")
+    cwd=$(jq -r '.cwd' "$session_file")
+    model=$(jq -r '.model' "$session_file")
+    turns=$(jq -r '.turns' "$session_file")
+
+    # Restore messages
+    jq '.messages' "$session_file" > "$MESSAGES_FILE"
+    TURN_COUNT=$turns
+    TOTAL_INPUT_TOKENS=$(jq -r '.input_tokens' "$session_file")
+    TOTAL_OUTPUT_TOKENS=$(jq -r '.output_tokens' "$session_file")
+    SESSION_ID="$id"
+
+    if [[ "$model" != "null" ]]; then
+        CLAUDE_MODEL="$model"
+    fi
+
+    print_success "Resumed session: $id ($turns turns)"
+    print_dim "  from: $cwd"
+}
+
+# Track token usage
+update_usage() {
+    local input_tokens="${1:-0}"
+    local output_tokens="${2:-0}"
+    local cache_read="${3:-0}"
+    local cache_write="${4:-0}"
+
+    TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + input_tokens))
+    TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + output_tokens))
+    TOTAL_CACHE_READ=$((TOTAL_CACHE_READ + cache_read))
+    TOTAL_CACHE_WRITE=$((TOTAL_CACHE_WRITE + cache_write))
+}
+
+# Calculate session cost
+get_session_cost() {
+    awk "BEGIN {
+        cost = ($TOTAL_INPUT_TOKENS * $PRICE_INPUT / 1000000) + \
+               ($TOTAL_OUTPUT_TOKENS * $PRICE_OUTPUT / 1000000) + \
+               ($TOTAL_CACHE_READ * $PRICE_CACHE_READ / 1000000) + \
+               ($TOTAL_CACHE_WRITE * $PRICE_CACHE_WRITE / 1000000)
+        printf \"%.4f\", cost
+    }"
+}
+
+# Truncate old messages if context gets too large
+# Simple strategy: keep system + last N turns
+maybe_compact_messages() {
+    local msg_count
+    msg_count=$(jq 'length' "$MESSAGES_FILE")
+
+    # Keep last 40 messages (20 turns) max
+    if (( msg_count > 40 )); then
+        local keep=40
+        jq --argjson keep "$keep" '.[-$keep:]' \
+            "$MESSAGES_FILE" > "$SESSION_DIR/tmp.json" && \
+            mv "$SESSION_DIR/tmp.json" "$MESSAGES_FILE"
+        print_dim "  (compacted: kept last $keep messages)"
+    fi
+}
+
+lib/tools.sh
+
+#!/usr/bin/env bash
+# tools.sh — Tool definitions and execution
+
+# Build tools JSON array for the API
+build_tools_json() {
+    cat <<'TOOLS'
+[
+  {
+    "name": "Bash",
+    "description": "Executes a bash command and returns its output. Use for running shell commands, installing packages, running tests, git operations, etc.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The bash command to execute"
+        },
+        "description": {
+          "type": "string",
+          "description": "Short description of what this command does"
+        },
+        "timeout": {
+          "type": "number",
+          "description": "Timeout in seconds (default 30, max 300)"
+        }
+      },
+      "required": ["command"]
+    }
+  },
+  {
+    "name": "Read",
+    "description": "Reads a file and returns its contents with line numbers. Use to understand code before modifying it.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the file to read"
+        },
+        "offset": {
+          "type": "number",
+          "description": "Line number to start reading from (1-indexed)"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum number of lines to read (default 2000)"
+        }
+      },
+      "required": ["file_path"]
+    }
+  },
+  {
+    "name": "Edit",
+    "description": "Performs string replacement in a file. The old_string must match exactly (including whitespace/indentation). Read the file first.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the file to edit"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "The exact string to find and replace"
+        },
+        "new_string": {
+          "type": "string",
+          "description": "The replacement string"
+        }
+      },
+      "required": ["file_path", "old_string", "new_string"]
+    }
+  },
+  {
+    "name": "Write",
+    "description": "Creates or overwrites a file with the given content. Use for creating new files.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the file to write"
+        },
+        "content": {
+          "type": "string",
+          "description": "The content to write to the file"
+        }
+      },
+      "required": ["file_path", "content"]
+    }
+  },
+  {
+    "name": "Glob",
+    "description": "Finds files matching a glob pattern. Returns file paths sorted by modification time.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Glob pattern (e.g. '**/*.ts', 'src/**/*.js')"
+        },
+        "path": {
+          "type": "string",
+          "description": "Directory to search in (default: cwd)"
+        }
+      },
+      "required": ["pattern"]
+    }
+  },
+  {
+    "name": "Grep",
+    "description": "Searches file contents using ripgrep. Supports regex patterns.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Regex pattern to search for"
+        },
+        "path": {
+          "type": "string",
+          "description": "File or directory to search in (default: cwd)"
+        },
+        "glob": {
+          "type": "string",
+          "description": "File pattern filter (e.g. '*.js')"
+        },
+        "case_insensitive": {
+          "type": "boolean",
+          "description": "Case insensitive search"
+        }
+      },
+      "required": ["pattern"]
+    }
+  }
+]
+TOOLS
+}
+
+# Execute a tool by name
+# Args: tool_name tool_id input_json
+# Returns: tool result as JSON string
+execute_tool() {
+    local tool_name="$1"
+    local tool_id="$2"
+    local input_json="$3"
+    local result=""
+    local is_error=false
+
+    case "$tool_name" in
+        Bash)   result=$(tool_bash "$input_json") ;;
+        Read)   result=$(tool_read "$input_json") ;;
+        Edit)   result=$(tool_edit "$input_json") ;;
+        Write)  result=$(tool_write "$input_json") ;;
+        Glob)   result=$(tool_glob "$input_json") ;;
+        Grep)   result=$(tool_grep "$input_json") ;;
+        *)
+            result="Unknown tool: $tool_name"
+            is_error=true
+            ;;
+    esac
+
+    local exit_code=$?
+    if (( exit_code != 0 )) && [[ "$is_error" == false ]]; then
+        is_error=true
+    fi
+
+    # Return tool_result block
+    if [[ "$is_error" == true ]]; then
+        jq -n \
+            --arg id "$tool_id" \
+            --arg content "$result" \
+            '{"type": "tool_result", "tool_use_id": $id, "content": $content, "is_error": true}'
+    else
+        jq -n \
+            --arg id "$tool_id" \
+            --arg content "$result" \
+            '{"type": "tool_result", "tool_use_id": $id, "content": $content}'
+    fi
+}
+
+# ── Tool Implementations ──────────────────────────────────────
+
+# Permission mode: "ask" (default), "allow" (trust all), "deny" (block writes)
+PERMISSION_MODE="${CLAUDE_SH_PERMISSIONS:-ask}"
+
+# Commands that are always safe (read-only)
+is_safe_command() {
+    local cmd="$1"
+    local base_cmd
+    base_cmd=$(echo "$cmd" | awk '{print $1}')
+
+    case "$base_cmd" in
+        ls|cat|head|tail|wc|find|grep|rg|ag|git\ log|git\ status|git\ diff|\
+        git\ show|git\ branch|echo|printf|pwd|date|whoami|uname|env|which|\
+        file|stat|du|df|tree|less|more|sort|uniq|diff|md5|shasum|type)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Ask user for permission to run a command
+ask_permission() {
+    local command="$1"
+
+    if [[ "$PERMISSION_MODE" == "allow" ]]; then
+        return 0
+    fi
+
+    if [[ "$PERMISSION_MODE" == "deny" ]]; then
+        return 1
+    fi
+
+    # Safe commands don't need permission
+    if is_safe_command "$command"; then
+        return 0
+    fi
+
+    # Interactive permission prompt
+    printf '%b  Allow Bash:%b %s %b[y/n/a]%b ' "$YELLOW" "$RESET" "$command" "$DIM" "$RESET" >&2
+    local answer
+    read -rn1 answer </dev/tty
+    printf '\n' >&2
+
+    case "$answer" in
+        y|Y) return 0 ;;
+        a|A) PERMISSION_MODE="allow"; return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+tool_bash() {
+    local input="$1"
+    local command timeout description
+    command=$(echo "$input" | jq -r '.command // empty')
+    timeout=$(echo "$input" | jq -r '.timeout // 30')
+    description=$(echo "$input" | jq -r '.description // empty')
+
+    if [[ -z "$command" ]]; then
+        echo "Error: command is required"
+        return 1
+    fi
+
+    # Cap timeout
+    (( timeout > 300 )) && timeout=300
+
+    # Display what we're running
+    print_tool_header "Bash" "$description"
+    printf '%b  $ %s%b\n' "$DIM" "$command" "$RESET"
+
+    # Permission check (only in interactive mode)
+    if [[ -t 0 ]]; then
+        if ! ask_permission "$command"; then
+            echo "Permission denied by user"
+            return 1
+        fi
+    fi
+
+    # Execute with timeout
+    local output exit_code
+    output=$(timeout "${timeout}s" bash -c "$command" 2>&1)
+    exit_code=$?
+
+    if (( exit_code == 124 )); then
+        output+=$'\n'"(timed out after ${timeout}s)"
+    fi
+
+    # Show truncated output
+    if [[ -n "$output" ]]; then
+        print_tool_output "$output" 30
+    fi
+
+    # Return full output (may be large)
+    if (( exit_code != 0 )); then
+        printf '%s\n(exit code: %d)' "$output" "$exit_code"
+        return 1
+    else
+        echo "$output"
+    fi
+}
+
+tool_read() {
+    local input="$1"
+    local file_path offset limit
+    file_path=$(echo "$input" | jq -r '.file_path // empty')
+    offset=$(echo "$input" | jq -r '.offset // 1')
+    limit=$(echo "$input" | jq -r '.limit // 2000')
+
+    if [[ -z "$file_path" ]]; then
+        echo "Error: file_path is required"
+        return 1
+    fi
+
+    # Expand ~ if present
+    file_path="${file_path/#\~/$HOME}"
+
+    if [[ ! -f "$file_path" ]]; then
+        echo "Error: file not found: $file_path"
+        return 1
+    fi
+
+    print_tool_header "Read" "$file_path"
+
+    # Read with line numbers, respecting offset and limit
+    local output
+    output=$(cat -n "$file_path" | tail -n "+${offset}" | head -n "$limit")
+
+    local total_lines
+    total_lines=$(wc -l < "$file_path")
+    local shown_lines
+    shown_lines=$(echo "$output" | wc -l)
+
+    print_dim "  ($shown_lines of $total_lines lines)"
+    echo "$output"
+}
+
+tool_edit() {
+    local input="$1"
+    local file_path old_string new_string
+    file_path=$(echo "$input" | jq -r '.file_path // empty')
+    old_string=$(echo "$input" | jq -r '.old_string // empty')
+    new_string=$(echo "$input" | jq -r '.new_string // empty')
+
+    if [[ -z "$file_path" ]] || [[ -z "$old_string" ]]; then
+        echo "Error: file_path and old_string are required"
+        return 1
+    fi
+
+    file_path="${file_path/#\~/$HOME}"
+
+    if [[ ! -f "$file_path" ]]; then
+        echo "Error: file not found: $file_path"
+        return 1
+    fi
+
+    # Check if old_string exists in file
+    if ! grep -qF "$old_string" "$file_path"; then
+        echo "Error: old_string not found in $file_path"
+        return 1
+    fi
+
+    # Count occurrences
+    local count
+    count=$(grep -cF "$old_string" "$file_path")
+    if (( count > 1 )); then
+        echo "Error: old_string matches $count locations. Provide more context to make it unique."
+        return 1
+    fi
+
+    print_tool_header "Edit" "$file_path"
+
+    # Use python3 for reliable multiline string replacement
+    python3 -c "
+import sys, os
+file_path, old_str, new_str = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(file_path, 'r') as f:
+    content = f.read()
+content = content.replace(old_str, new_str, 1)
+with open(file_path, 'w') as f:
+    f.write(content)
+" "$file_path" "$old_string" "$new_string"
+
+    print_success "  Edited successfully"
+    echo "Edited $file_path: replaced 1 occurrence"
+}
+
+tool_write() {
+    local input="$1"
+    local file_path content
+    file_path=$(echo "$input" | jq -r '.file_path // empty')
+    content=$(echo "$input" | jq -r '.content // empty')
+
+    if [[ -z "$file_path" ]]; then
+        echo "Error: file_path is required"
+        return 1
+    fi
+
+    file_path="${file_path/#\~/$HOME}"
+
+    # Create parent dirs if needed
+    mkdir -p "$(dirname "$file_path")"
+
+    print_tool_header "Write" "$file_path"
+
+    printf '%s' "$content" > "$file_path"
+
+    local lines
+    lines=$(echo "$content" | wc -l)
+    print_success "  Wrote $lines lines"
+    echo "Wrote $file_path ($lines lines)"
+}
+
+tool_glob() {
+    local input="$1"
+    local pattern search_path
+    pattern=$(echo "$input" | jq -r '.pattern // empty')
+    search_path=$(echo "$input" | jq -r '.path // empty')
+
+    if [[ -z "$pattern" ]]; then
+        echo "Error: pattern is required"
+        return 1
+    fi
+
+    [[ -z "$search_path" ]] && search_path="."
+    search_path="${search_path/#\~/$HOME}"
+
+    print_tool_header "Glob" "$pattern"
+
+    local output
+    # Use find with glob pattern, exclude .git
+    output=$(find "$search_path" -path '*/.git' -prune -o -name "$pattern" -print 2>/dev/null | \
+             head -n 100 | sort)
+
+    # If simple glob doesn't work, try with bash globstar
+    if [[ -z "$output" ]]; then
+        output=$(cd "$search_path" && bash -O globstar -c "ls -1 $pattern 2>/dev/null" | head -n 100)
+    fi
+
+    local count
+    count=$(echo "$output" | grep -c .)
+    print_dim "  ($count files found)"
+    echo "$output"
+}
+
+tool_grep() {
+    local input="$1"
+    local pattern search_path file_glob case_flag
+    pattern=$(echo "$input" | jq -r '.pattern // empty')
+    search_path=$(echo "$input" | jq -r '.path // empty')
+    file_glob=$(echo "$input" | jq -r '.glob // empty')
+    local case_insensitive
+    case_insensitive=$(echo "$input" | jq -r '.case_insensitive // false')
+
+    if [[ -z "$pattern" ]]; then
+        echo "Error: pattern is required"
+        return 1
+    fi
+
+    [[ -z "$search_path" ]] && search_path="."
+    search_path="${search_path/#\~/$HOME}"
+
+    print_tool_header "Grep" "$pattern"
+
+    local args=("--no-heading" "--line-number" "--color=never")
+    [[ "$case_insensitive" == "true" ]] && args+=("-i")
+    [[ -n "$file_glob" ]] && args+=("--glob" "$file_glob")
+
+    local output
+    if command -v rg &>/dev/null; then
+        output=$(rg "${args[@]}" "$pattern" "$search_path" 2>/dev/null | head -n 250)
+    else
+        # Fallback to grep
+        local grep_args=("-rn" "--color=never")
+        [[ "$case_insensitive" == "true" ]] && grep_args+=("-i")
+        output=$(grep "${grep_args[@]}" "$pattern" "$search_path" 2>/dev/null | head -n 250)
+    fi
+
+    local count
+    count=$(echo "$output" | grep -c . 2>/dev/null || echo 0)
+    print_dim "  ($count matches)"
+    echo "$output"
+}
+
+lib/tui.sh
+
+#!/usr/bin/env bash
+# tui.sh — ANSI colors, spinner, display helpers
+
+# Colors
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+UNDERLINE='\033[4m'
+
+# Claude orange
+CLAUDE='\033[38;2;204;136;68m'
+CLAUDE_BG='\033[48;2;204;136;68m'
+
+# Semantic colors
+RED='\033[38;2;255;85;85m'
+GREEN='\033[38;2;85;255;85m'
+YELLOW='\033[38;2;255;255;85m'
+BLUE='\033[38;2;85;85;255m'
+CYAN='\033[38;2;85;255;255m'
+MAGENTA='\033[38;2;255;85;255m'
+GRAY='\033[38;2;128;128;128m'
+WHITE='\033[38;2;220;220;220m'
+
+# Spinner verbs (from the original source)
+SPINNER_VERBS=(
+    "Accomplishing" "Architecting" "Baking" "Beboppin'" "Bloviating"
+    "Boondoggling" "Bootstrapping" "Brewing" "Canoodling" "Caramelizing"
+    "Cerebrating" "Clauding" "Cogitating" "Combobulating" "Computing"
+    "Contemplating" "Cooking" "Crafting" "Crystallizing" "Deliberating"
+    "Discombobulating" "Fermenting" "Finagling" "Flibbertigibbeting"
+    "Gallivanting" "Generating" "Harmonizing" "Hatching" "Hullaballooing"
+    "Ideating" "Imagining" "Inferring" "Lollygagging" "Manifesting"
+    "Meandering" "Moonwalking" "Mulling" "Noodling" "Orchestrating"
+    "Percolating" "Pondering" "Processing" "Quantumizing" "Razzmatazzing"
+    "Recombobulating" "Ruminating" "Simmering" "Synthesizing" "Thinking"
+    "Tinkering" "Tomfoolering" "Vibing" "Whatchamacalliting" "Working"
+    "Zigzagging"
+)
+
+random_verb() {
+    echo "${SPINNER_VERBS[$((RANDOM % ${#SPINNER_VERBS[@]}))]}"
+}
+
+# Spinner management
+SPINNER_PID=""
+SPINNER_ACTIVE=false
+
+start_spinner() {
+    local verb
+    verb=$(random_verb)
+    SPINNER_ACTIVE=true
+
+    (
+        local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        local i=0
+        local elapsed=0
+        local start_time=$SECONDS
+        while true; do
+            elapsed=$(( SECONDS - start_time ))
+            printf '\r\033[K%b%s %s... %b(%ds)%b' \
+                "$CLAUDE" "${frames[$i]}" "$verb" "$DIM" "$elapsed" "$RESET"
+            i=$(( (i + 1) % ${#frames[@]} ))
+            sleep 0.08
+        done
+    ) &
+    SPINNER_PID=$!
+    disown "$SPINNER_PID" 2>/dev/null
+}
+
+stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null
+        wait "$SPINNER_PID" 2>/dev/null
+        SPINNER_PID=""
+        SPINNER_ACTIVE=false
+        printf '\r\033[K'
+    fi
+}
+
+# Display helpers
+print_claude() {
+    printf '%b%s%b\n' "$CLAUDE" "$1" "$RESET"
+}
+
+print_error() {
+    printf '%b%s error:%b %s\n' "$RED$BOLD" "claude.sh" "$RESET" "$1" >&2
+}
+
+print_warning() {
+    printf '%b%s warning:%b %s\n' "$YELLOW" "claude.sh" "$RESET" "$1" >&2
+}
+
+print_success() {
+    printf '%b%s%b\n' "$GREEN" "$1" "$RESET"
+}
+
+print_dim() {
+    printf '%b%s%b\n' "$DIM" "$1" "$RESET"
+}
+
+print_tool_header() {
+    local tool_name="$1"
+    local detail="$2"
+    printf '%b %b%s%b' "$DIM" "$CYAN$BOLD" "$tool_name" "$RESET"
+    if [[ -n "$detail" ]]; then
+        printf ' %b%s%b' "$DIM" "$detail" "$RESET"
+    fi
+    printf '\n'
+}
+
+print_tool_output() {
+    local output="$1"
+    local max_lines="${2:-50}"
+    local line_count
+    line_count=$(echo "$output" | wc -l)
+
+    if (( line_count > max_lines )); then
+        echo "$output" | head -n "$max_lines"
+        printf '%b... (%d more lines)%b\n' "$DIM" "$(( line_count - max_lines ))" "$RESET"
+    else
+        echo "$output"
+    fi
+}
+
+print_cost() {
+    local cost="$1"
+    local input_tokens="$2"
+    local output_tokens="$3"
+    printf '\n%b  Session cost: $%s | %s input tokens | %s output tokens%b\n' \
+        "$DIM" "$cost" "$input_tokens" "$output_tokens" "$RESET"
+}
+
+print_separator() {
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    printf '%b%*s%b\n' "$DIM" "$cols" '' "$RESET" | tr ' ' '─'
+}
+
+# Banner
+print_banner() {
+    printf '\n'
+    printf '%b╭─────────────────────────────╮%b\n' "$CLAUDE" "$RESET"
+    printf '%b│%b  claude.sh %b— bash edition  %b│%b\n' "$CLAUDE" "$BOLD$WHITE" "$DIM" "$CLAUDE" "$RESET"
+    printf '%b╰─────────────────────────────╯%b\n' "$CLAUDE" "$RESET"
+    printf '%b  model: %s%b\n' "$DIM" "${CLAUDE_MODEL:-claude-sonnet-4-20250514}" "$RESET"
+    printf '%b  type /help for commands, ctrl-c to cancel%b\n\n' "$DIM" "$RESET"
+}
+
+# Prompt
+print_prompt() {
+    printf '%b❯%b ' "$CLAUDE" "$RESET"
+}
+
+# Cleanup handler
+cleanup_tui() {
+    stop_spinner
+    printf '%b' "$RESET"
+    tput cnorm 2>/dev/null  # Show cursor
+}
+
+README.md
+
+# claude.sh
+
+Claude Code rewritten as a bash script. ~1,500 lines. Zero npm packages.
+
+## Why
+
+The original Claude Code is ~380,000 lines of TypeScript with 266 npm dependencies. This does the same core job in bash with just `curl` and `jq`.
+
+## Features
+
+- **Real-time streaming** via FIFO pipe — text appears as Claude generates it
+- **6 tools**: Bash, Read, Edit, Write, Glob, Grep
+- **Tool chaining** — up to 25 tool calls per turn
+- **Permission prompting** — asks before running non-safe commands (`y/n/a`)
+- **CLAUDE.md loading** — reads project instructions from CLAUDE.md files up the directory tree
+- **Git-aware context** — branch, status, and recent commits in system prompt
+- **Session save/resume** — auto-saves on exit, resume with `--resume <id>`
+- **Retry with backoff** — exponential retry on 429/529 rate limits
+- **Cost tracking** — per-turn and session totals
+- **Spinner** — with the original spinner verbs (Clauding, Flibbertigibbeting, etc.)
+- **Slash commands** — `/help`, `/cost`, `/model`, `/clear`, `/save`, `/resume`, `/commit`, `/diff`
+- **Pipe mode** — `echo "explain this" | ./claude.sh`
+
+## Install
+
+```bash
+git clone https://github.com/jdcodes1/claude.sh.git
+cd claude.sh
+chmod +x claude.sh
+```
+
+## Dependencies
+
+- `curl`
+- `jq`
+- Optional: `rg` (ripgrep) for better search
+- Optional: `python3` for the edit tool
+
+## Usage
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+./claude.sh
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | (required) | Your Anthropic API key |
+| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Model to use |
+| `CLAUDE_MAX_TOKENS` | `8192` | Max output tokens |
+| `ANTHROPIC_API_URL` | `https://api.anthropic.com` | API base URL |
+| `CLAUDE_SH_PERMISSIONS` | `ask` | Permission mode: `ask`, `allow`, or `deny` |
+
+### Commands
+
+```
+/help      — Show help
+/cost      — Show session cost
+/model     — Show/change model
+/clear     — Clear conversation
+/save      — Save current session
+/resume    — List/resume saved sessions
+/commit    — Auto-generate a git commit
+/diff      — Show git diff
+/quit      — Exit
+```
+
+### Resume a Session
+
+```bash
+# List saved sessions
+./claude.sh
+> /resume
+
+# Resume by number
+> /resume 1
+
+# Resume from CLI
+./claude.sh --resume 20240101-120000-12345
+```
+
+## Architecture
+
+```
+claude.sh          # Main REPL loop, slash commands, process_turn()
+lib/
+  api.sh           # Anthropic API client, SSE streaming via FIFO, retry
+  json.sh          # Message construction, session persistence, CLAUDE.md, git context
+  tools.sh         # 6 tool implementations + permission system
+  tui.sh           # ANSI colors, spinner, display helpers
+```
+
+## How It Works
+
+1. Read user input
+2. Build JSON request with `jq` (messages, tools, system prompt)
+3. Stream response via `curl` through a FIFO pipe
+4. Parse SSE events line-by-line, print text deltas in real-time
+5. When tool_use blocks arrive, execute the tools
+6. Feed tool results back as messages
+7. Loop until Claude stops calling tools
+
+## Comparison
+
+| | claude.sh | Claude Code (TypeScript) |
+|---|---|---|
+| Lines of code | ~1,500 | ~380,000 |
+| Dependencies | curl, jq | 266 npm packages |
+| Binary size | 0 (script) | ~200MB node_modules |
+| Startup time | Instant | ~500ms |
+
+## License
+
+MIT

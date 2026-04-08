@@ -1,0 +1,2 @@
+Folder: x-zheng16_System-Prompt-Open.zip
+Content root: C:\Users\s616279\Documents\ClaudeThings\x-zheng16_System-Prompt-Open.zip

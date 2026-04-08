@@ -1,0 +1,787 @@
+﻿Folder: openmemory-main
+Path: C:\Users\s616279\Downloads\openmemory-main
+
+File: openmemory-main\.gitignore
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+
+
+File: openmemory-main\.mcp.json
+{
+  "mcpServers": {
+    "openmemory": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+
+
+File: openmemory-main\.mcp.json.example
+{
+  "mcpServers": {
+    "openmemory": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+
+
+File: openmemory-main\install.sh
+#!/bin/bash
+# â”€â”€ Install OpenMemory hooks into your shell config â”€â”€
+set -e
+
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+SHELL_RC="$HOME/.zshrc"
+SHELL_NAME="zsh"
+
+HOOK_MARKER="# â”€â”€ OpenMemory auto-start/stop hooks"
+HOOK_END="# â”€â”€ End OpenMemory hooks"
+
+MANAGER_SRC="source \"$REPO_DIR/openmemory-manager.sh\""
+
+# Detect shell
+if [[ -f "$HOME/.bashrc" ]] && [[ ! -f "$HOME/.zshrc" ]]; then
+    SHELL_RC="$HOME/.bashrc"
+    SHELL_NAME="bash"
+fi
+
+echo "Installing OpenMemory hooks for $SHELL_NAME..."
+
+echo ""
+
+# 1. Link manager script
+echo "Manager script: $REPO_DIR/openmemory-manager.sh"
+
+# 2. Add hooks to shell RC if not already present
+if grep -q "$HOOK_MARKER" "$SHELL_RC" 2>/dev/null; then
+    echo "Hooks already installed in $SHELL_RC"
+    echo "To reinstall, remove the old block first, then run this script again."
+    exit 0
+fi
+
+# Generate the hook block
+cat >> "$SHELL_RC" << SHEOF
+
+$HOOK_MARKER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$MANAGER_SRC
+
+# Helper: wrap an AI CLI with auto memory lifecycle
+_om_wrap() {
+  local _om_started=false
+  if _om_ensure_running; then
+    _om_ref_incr
+    _om_started=true
+  fi
+  command "\$@"
+  local ret=\$?
+  [[ "\$_om_started" == true ]] && _om_ref_decr
+  return \$ret
+}
+
+claude()   { _om_wrap claude   "\$@"; }
+codex()    { _om_wrap codex    "\$@"; }
+gemini()   { _om_wrap gemini   "\$@"; }
+opencode() { _om_wrap opencode "\$@"; }
+
+# Cleanup: decrement counter when terminal closes
+zshexit() {
+  _om_ref_decr
+}
+$HOOK_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+SHEOF
+
+echo "Hooks installed in $SHELL_RC"
+echo ""
+echo "Next steps:"
+echo "  1. Clone & set up OpenMemory server:"
+echo "     git clone https://github.com/CaviraOSS/OpenMemory.git ~/OpenMemory"
+echo "     cd ~/OpenMemory/packages/openmemory-js && npm install && npm run build"
+echo ""
+echo "  2. Set environment variables (optional):"
+echo "     export OPENMEMORY_DIR=\$HOME/OpenMemory/packages/openmemory-js"
+echo "     export OPENMEMORY_PORT=8080"
+echo ""
+echo "  3. Restart your terminal, then run claude, opencode, codex, or gemini"
+echo "     OpenMemory will auto-start and auto-stop."
+
+
+File: openmemory-main\openmemory-codex-proxy.py
+#!/usr/bin/env python3
+"""OpenMemory STDIO MCP Proxy for Codex CLI.
+
+Bridges Codex CLI's STDIO-only MCP support to OpenMemory's HTTP MCP endpoint.
+Uses FastMCP's built-in proxy to forward all MCP calls transparently.
+Requires: pip install fastmcp
+"""
+
+import atexit
+import os
+import shlex
+import subprocess
+from pathlib import Path
+from fastmcp.server import create_proxy
+
+OM_URL = os.environ.get("OPENMEMORY_URL", "http://localhost:8080")
+OM_MANAGER = os.environ.get(
+    "OPENMEMORY_MANAGER",
+    str(Path(__file__).resolve().with_name("openmemory-manager.sh")),
+)
+
+
+def _run_manager(func_name: str) -> None:
+    """Best-effort invocation of lifecycle helpers in openmemory-manager.sh."""
+    if not Path(OM_MANAGER).is_file():
+        return
+
+    command = f"source {shlex.quote(OM_MANAGER)}; {func_name}"
+    subprocess.run(
+        ["/bin/zsh", "-lc", command],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _acquire_openmemory() -> None:
+    _run_manager("_om_ensure_running")
+    _run_manager("_om_ref_incr")
+
+
+def _release_openmemory() -> None:
+    _run_manager("_om_ref_decr")
+
+
+proxy = create_proxy(f"{OM_URL}/mcp", name="openmemory")
+
+if __name__ == "__main__":
+    _acquire_openmemory()
+    atexit.register(_release_openmemory)
+    proxy.run()
+
+
+File: openmemory-main\openmemory-manager.sh
+#!/bin/bash
+# OpenMemory Manager â€” auto start/stop with reference counting
+#
+# Manages OpenMemory server lifecycle across multiple AI CLI sessions.
+# Source this from your shell config (.zshrc / .bashrc).
+
+set -eu
+
+OM_LOCK_DIR="${OPENMEMORY_LOCK_DIR:-/tmp/openmemory}"
+OM_REF_FILE="$OM_LOCK_DIR/refcount"
+OM_LOG="${OPENMEMORY_LOG:-/tmp/openmemory.log}"
+OM_DIR="${OPENMEMORY_DIR:-$HOME/OpenMemory/packages/openmemory-js}"
+OM_PORT="${OPENMEMORY_PORT:-8080}"
+
+# â”€â”€ Start OpenMemory if not already running â”€â”€
+_om_ensure_running() {
+    if curl -sf "http://localhost:${OM_PORT}/health" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    _om_reset_if_stale
+
+    mkdir -p "$OM_LOCK_DIR"
+    (cd "$OM_DIR" && nohup node dist/server/index.js > "$OM_LOG" 2>&1 &)
+
+    local i
+    for i in {1..15}; do
+        if curl -sf "http://localhost:${OM_PORT}/health" > /dev/null 2>&1; then
+            echo "OpenMemory started (pid: $(lsof -ti :${OM_PORT} 2>/dev/null || echo ''))"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "OpenMemory failed to start. See $OM_LOG" >&2
+    return 1
+}
+
+# â”€â”€ Reference count: increment â”€â”€
+_om_ref_incr() {
+    mkdir -p "$OM_LOCK_DIR"
+    local count=0
+    [[ -f "$OM_REF_FILE" ]] && count=$(< "$OM_REF_FILE" 2>/dev/null)
+    echo $((count + 1)) > "$OM_REF_FILE"
+}
+
+# â”€â”€ Reference count: decrement, stop if zero â”€â”€
+_om_ref_decr() {
+    local count=0
+    [[ -f "$OM_REF_FILE" ]] && count=$(< "$OM_REF_FILE" 2>/dev/null)
+    # Don't decrement if already 0 (prevents manual starts from being killed)
+    [[ "$count" -le 0 ]] && return 0
+    count=$((count - 1))
+    if [[ "$count" -le 0 ]]; then
+        echo 0 > "$OM_REF_FILE"
+        _om_stop
+    else
+        echo "$count" > "$OM_REF_FILE"
+    fi
+}
+
+# â”€â”€ Stop OpenMemory server â”€â”€
+_om_stop() {
+    local pid
+    pid=$(lsof -ti :${OM_PORT} 2>/dev/null)
+    if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null
+        echo "OpenMemory stopped"
+    fi
+    echo 0 > "$OM_REF_FILE"
+}
+
+# â”€â”€ Reset stale counter (server dead but refcount > 0) â”€â”€
+_om_reset_if_stale() {
+    [[ ! -f "$OM_REF_FILE" ]] && return 0
+    local count
+    count=$(< "$OM_REF_FILE" 2>/dev/null)
+    [[ "$count" -gt 0 ]] || return 0
+
+    if ! curl -sf "http://localhost:${OM_PORT}/health" > /dev/null 2>&1; then
+        echo 0 > "$OM_REF_FILE"
+    fi
+}
+
+
+File: openmemory-main\README.md
+# OpenMemory Auto Manager
+
+> Auto start/stop [OpenMemory](https://github.com/CaviraOSS/OpenMemory) MCP server across Claude Code, OpenCode, Codex CLI, and Gemini CLI.
+
+Share long-term memory across all your AI agents â€” no manual start/stop needed.
+
+![OpenMemory Banner](openmemory-banner.png)
+
+[**ç¹é«”ä¸­æ–‡**](#ç¹é«”ä¸­æ–‡ç‰ˆ)
+
+---
+
+## How It Works
+
+```
+Terminal 1: type claude    â†’ OpenMemory auto-starts (refcount = 1)
+Terminal 2: type opencode   â†’ shares same server    (refcount = 2)
+Terminal 3: type gemini    â†’ shares same server    (refcount = 3)
+Terminal 4: type codex     â†’ shares same server    (refcount = 4)
+Terminal 1: exits          â†’ still running         (refcount = 3)
+Terminal 2: exits          â†’ still running         (refcount = 2)
+Terminal 3: exits          â†’ still running         (refcount = 1)
+Terminal 4: exits          â†’ auto stops            (refcount = 0)
+```
+
+Reference counting ensures OpenMemory only runs when needed and shuts down when the last session closes.
+
+## Architecture
+
+```
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                    Your Machine                               â”‚
+â”‚                                                              â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â” â”‚
+â”‚  â”‚ Claude Code  â”‚  â”‚ OpenCode   â”‚  â”‚ Gemini CLI   â”‚  â”‚ Codexâ”‚ â”‚
+â”‚  â”‚             â”‚  â”‚            â”‚  â”‚              â”‚  â”‚ CLI  â”‚ â”‚
+â”‚  â”‚ HTTP MCP â”€â”€â”€â”¼â”€â”€â”¼â”€â”€ HTTP MCP â”‚â”€â”€â”¼â”€â”€ HTTP MCP   â”‚  â”‚STDIO â”‚ â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â”‚ only â”‚ â”‚
+â”‚         â”‚                â”‚                â”‚         â”‚      â”‚ â”‚
+â”‚         â”‚                â”‚                â”‚         â”‚Pythonâ”‚ â”‚
+â”‚         â”‚                â”‚                â”‚         â”‚Proxy â”‚ â”‚
+â”‚         â–¼                â–¼                â–¼         â””â”€â”€â”¬â”€â”€â”€â”˜ â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”‚
+â”‚  â”‚       OpenMemory MCP Server                         â”‚    â”‚
+â”‚  â”‚       localhost:8080                                 â”‚    â”‚
+â”‚  â”‚                                                      â”‚    â”‚
+â”‚  â”‚  â€¢ Synthetic embeddings (no API keys)               â”‚    â”‚
+â”‚  â”‚  â€¢ SQLite vector store                              â”‚    â”‚
+â”‚  â”‚  â€¢ HSG tiered memory architecture                   â”‚    â”‚
+â”‚  â”‚  â€¢ MCP tools: store, query, list, delete            â”‚    â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â”‚
+â”‚                                                              â”‚
+â”‚  Lifecycle managed by openmemory-manager.sh                  â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                          â”‚
+â”‚  â”‚ _om_ensure_running()           â”‚                          â”‚
+â”‚  â”‚ _om_ref_incr() / _om_decr()   â”‚                          â”‚
+â”‚  â”‚ zshexit cleanup hook           â”‚                          â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                          â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```
+
+## Features
+
+- **Zero config** â€” no API keys, no Docker, no external services
+- **Auto lifecycle** â€” server starts on first CLI launch, stops when all terminals close
+- **Cross-tool memory** â€” Claude Code, OpenCode, Codex CLI, and Gemini CLI share the same memory store
+- **Codex STDIO bridge** â€” Python proxy translates STDIO MCP to HTTP MCP for Codex CLI
+- **Reference counting** â€” safe multi-terminal usage with automatic cleanup
+- **Stale recovery** â€” resets counter if server crashes unexpectedly
+
+## Prerequisites
+
+- [OpenMemory server](https://github.com/CaviraOSS/OpenMemory) installed at `~/OpenMemory`
+- Python 3.10+ with `fastmcp` (for Codex CLI proxy)
+- Node.js 18+ (for OpenMemory server)
+- `curl`, `lsof` (standard macOS/Linux tools)
+
+### Install OpenMemory Server
+
+```bash
+git clone https://github.com/CaviraOSS/OpenMemory.git ~/OpenMemory
+cd ~/OpenMemory/packages/openmemory-js
+npm install
+npm run build
+```
+
+## Install
+
+```bash
+git clone git@github.com:vancelin/openmemory.git ~/dev/memory
+cd ~/dev/memory
+
+# Create Python venv and install proxy dependency
+uv venv .venv --python 3.11
+uv pip install fastmcp --python .venv/bin/python
+
+# Install shell hooks
+chmod +x install.sh openmemory-manager.sh openmemory-codex-proxy.py
+./install.sh
+```
+
+Restart your terminal, then run `claude`, `opencode`, `codex`, or `gemini` â€” OpenMemory starts automatically.
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `openmemory-manager.sh` | Core lifecycle manager â€” start/stop with reference counting |
+| `openmemory-codex-proxy.py` | FastMCP STDIOâ†’HTTP proxy for Codex CLI |
+| `install.sh` | One-command shell hook installer (idempotent) |
+| `.mcp.json` | Claude Code / OpenCode MCP config (HTTP transport) |
+| `.mcp.json.example` | Example MCP config for reference |
+
+## MCP Configuration
+
+### Claude Code / OpenCode â€” `.mcp.json`
+
+Place in project root or `~/.claude/.mcp.json` (Claude Code) / `~/.opencode/.mcp.json` (OpenCode) for global access:
+
+```json
+{
+  "mcpServers": {
+    "openmemory": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+**Note:** OpenCode supports the same `.mcp.json` format as Claude Code for MCP server configuration.
+
+### Gemini CLI â€” `~/.gemini/settings.json`
+
+```json
+{
+  "mcpServers": {
+    "openmemory": {
+      "httpUrl": "http://localhost:8080/mcp",
+      "trust": true
+    }
+  }
+}
+```
+
+### Codex CLI â€” `~/.codex/config.toml`
+
+```toml
+[mcp_servers.openmemory]
+command = "/path/to/.venv/bin/python"
+args = ["/path/to/openmemory-codex-proxy.py"]
+```
+
+Codex CLI only supports STDIO transport. The proxy script uses FastMCP's `create_proxy` to transparently bridge all MCP tool calls to OpenMemory's HTTP endpoint.
+
+## Available MCP Tools
+
+OpenMemory exposes these tools to all connected agents:
+
+| Tool | Description |
+|------|-------------|
+| `openmemory_store` | Store a memory (text, facts, or both) |
+| `openmemory_query` | Semantic search across stored memories |
+| `openmemory_list` | List recent memories |
+| `openmemory_get` | Fetch a single memory by ID |
+| `openmemory_reinforce` | Boost salience of a memory |
+| `openmemory_delete` | Delete a memory by ID |
+
+## Usage
+
+Once OpenMemory is running, all three CLIs can store and search memories through the MCP tools. Just ask naturally:
+
+### Storing Memories
+
+```
+You: Remember that I prefer dark mode in all editors
+Claude: *calls openmemory_store* â†’ Stored!
+```
+
+```
+You: æˆ‘å–œæ­¡ç”¨ Python å¯«å¾Œç«¯ï¼Œå‰ç«¯ç”¨ React
+Gemini: *calls openmemory_store* â†’ Stored!
+```
+
+```
+You: Note that the production DB port is 5433, not 5432
+Codex: *calls openmemory_store* â†’ Stored!
+```
+
+### Searching Memories
+
+```
+You: What's my editor preference?
+Claude: *calls openmemory_query("editor preference")* â†’ "You prefer dark mode in all editors"
+```
+
+```
+You: ç”Ÿç”¢ç’°å¢ƒçš„ DB port æ˜¯å¤šå°‘ï¼Ÿ
+Gemini: *calls openmemory_query("production DB port")* â†’ "5433"
+```
+
+### Cross-Tool Recall
+
+```
+# Stored in Claude Code
+You (Claude): Remember my project uses PostgreSQL 16
+
+# Recalled in Gemini CLI
+You (Gemini): What database does my project use?
+Gemini: *calls openmemory_query* â†’ "Your project uses PostgreSQL 16"
+```
+
+That's it â€” memories stored in one CLI are instantly available in all others.
+
+## Screenshots
+
+**Claude Code** â€” storing and querying memories via OpenMemory MCP tools:
+
+![Claude Code](claudecode.png)
+
+**Gemini CLI** â€” reading memories stored by other agents:
+
+![Gemini CLI](gemini.png)
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENMEMORY_DIR` | `~/OpenMemory/packages/openmemory-js` | OpenMemory server path |
+| `OPENMEMORY_PORT` | `8080` | Server port |
+| `OPENMEMORY_URL` | `http://localhost:8080` | Codex proxy target URL |
+| `OPENMEMORY_LOCK_DIR` | `/tmp/openmemory` | Lock/refcount directory |
+| `OPENMEMORY_LOG` | `/tmp/openmemory.log` | Server log file |
+| `OPENMEMORY_USER_ID` | `$(whoami)` | Default user ID for memory isolation |
+
+## Uninstall
+
+Remove the hooks block from `~/.zshrc` (between the `OpenMemory auto-start/stop hooks` markers):
+
+```bash
+sed -i '' '/# â”€â”€ OpenMemory auto-start/,/# â”€â”€ End OpenMemory hooks/d' ~/.zshrc
+```
+
+Then remove the MCP configs from each CLI's settings file.
+
+## License
+
+MIT
+
+---
+
+<a id="ç¹é«”ä¸­æ–‡ç‰ˆ"></a>
+
+# ç¹é«”ä¸­æ–‡ç‰ˆ
+
+# OpenMemory è‡ªå‹•ç®¡ç†å™¨
+
+> è·¨ Claude Codeã€OpenCodeã€Codex CLIã€Gemini CLI è‡ªå‹•å•Ÿå‹•/é—œé–‰ [OpenMemory](https://github.com/CaviraOSS/OpenMemory) MCP è¨˜æ†¶ä¼ºæœå™¨ã€‚
+
+è®“æ‰€æœ‰ AI Agent å…±ç”¨é•·æœŸè¨˜æ†¶ â€” ç„¡éœ€æ‰‹å‹•å•Ÿåœã€‚
+
+![OpenMemory Banner](openmemory-banner.png)
+
+## é‹ä½œåŽŸç†
+
+```
+çµ‚ç«¯æ©Ÿ 1: è¼¸å…¥ claude    â†’ OpenMemory è‡ªå‹•å•Ÿå‹•  (refcount = 1)
+çµ‚ç«¯æ©Ÿ 2: è¼¸å…¥ opencode   â†’ å…±ç”¨åŒä¸€å€‹ä¼ºæœå™¨      (refcount = 2)
+çµ‚ç«¯æ©Ÿ 3: è¼¸å…¥ gemini    â†’ å…±ç”¨åŒä¸€å€‹ä¼ºæœå™¨      (refcount = 3)
+çµ‚ç«¯æ©Ÿ 4: è¼¸å…¥ codex     â†’ å…±ç”¨åŒä¸€å€‹ä¼ºæœå™¨      (refcount = 4)
+çµ‚ç«¯æ©Ÿ 1: é—œé–‰           â†’ ä»ç„¶é‹è¡Œ             (refcount = 3)
+çµ‚ç«¯æ©Ÿ 2: é—œé–‰           â†’ ä»ç„¶é‹è¡Œ             (refcount = 2)
+çµ‚ç«¯æ©Ÿ 3: é—œé–‰           â†’ ä»ç„¶é‹è¡Œ             (refcount = 1)
+çµ‚ç«¯æ©Ÿ 4: é—œé–‰           â†’ è‡ªå‹•åœæ­¢             (refcount = 0)
+```
+
+åƒè€ƒè¨ˆæ•¸æ©Ÿåˆ¶ç¢ºä¿ OpenMemory åªåœ¨éœ€è¦æ™‚é‹è¡Œï¼Œæœ€å¾Œä¸€å€‹çµ‚ç«¯æ©Ÿé—œé–‰æ™‚è‡ªå‹•åœæ­¢ã€‚
+
+## æž¶æ§‹
+
+```
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                      ä½ çš„é›»è…¦                                 â”‚
+â”‚                                                              â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”Œâ”€â”€â”€â”€â”€â”€â” â”‚
+â”‚  â”‚ Claude Code  â”‚  â”‚ OpenCode   â”‚  â”‚ Gemini CLI   â”‚  â”‚ Codexâ”‚ â”‚
+â”‚  â”‚             â”‚  â”‚            â”‚  â”‚              â”‚  â”‚ CLI  â”‚ â”‚
+â”‚  â”‚ HTTP MCP â”€â”€â”€â”¼â”€â”€â”¼â”€â”€ HTTP MCP â”‚â”€â”€â”¼â”€â”€ HTTP MCP   â”‚  â”‚åƒ…STDIOâ”‚ â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â”‚      â”‚ â”‚
+â”‚         â”‚                â”‚                â”‚         â”‚Pythonâ”‚ â”‚
+â”‚         â”‚                â”‚                â”‚         â”‚Proxy â”‚ â”‚
+â”‚         â–¼                â–¼                â–¼         â””â”€â”€â”¬â”€â”€â”€â”˜ â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”‚
+â”‚  â”‚       OpenMemory MCP ä¼ºæœå™¨                         â”‚    â”‚
+â”‚  â”‚       localhost:8080                                 â”‚    â”‚
+â”‚  â”‚                                                      â”‚    â”‚
+â”‚  â”‚  â€¢ åˆæˆå¼åµŒå…¥ï¼ˆä¸éœ€è¦ API Keyï¼‰                      â”‚    â”‚
+â”‚  â”‚  â€¢ SQLite å‘é‡è³‡æ–™åº«                                 â”‚    â”‚
+â”‚  â”‚  â€¢ HSG åˆ†å±¤è¨˜æ†¶æž¶æ§‹                                  â”‚    â”‚
+â”‚  â”‚  â€¢ MCP å·¥å…·ï¼šå„²å­˜ã€æŸ¥è©¢ã€åˆ—è¡¨ã€åˆªé™¤                  â”‚    â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â”‚
+â”‚                                                              â”‚
+â”‚  ç”Ÿå‘½é€±æœŸç”± openmemory-manager.sh ç®¡ç†                        â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                          â”‚
+â”‚  â”‚ _om_ensure_running()           â”‚                          â”‚
+â”‚  â”‚ _om_ref_incr() / _om_decr()   â”‚                          â”‚
+â”‚  â”‚ zshexit æ¸…ç†é‰¤å­               â”‚                          â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                          â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```
+
+## ç‰¹è‰²
+
+- **é›¶è¨­å®š** â€” ä¸éœ€è¦ API Keyã€ä¸éœ€è¦ Dockerã€ä¸éœ€è¦å¤–éƒ¨æœå‹™
+- **è‡ªå‹•ç”Ÿå‘½é€±æœŸ** â€” ç¬¬ä¸€å€‹ CLI å•Ÿå‹•æ™‚ä¼ºæœå™¨å•Ÿå‹•ï¼Œæ‰€æœ‰çµ‚ç«¯æ©Ÿé—œé–‰æ™‚è‡ªå‹•åœæ­¢
+- **è·¨å·¥å…·è¨˜æ†¶** â€” Claude Codeã€OpenCodeã€Codex CLIã€Gemini CLI å…±ç”¨åŒä¸€å€‹è¨˜æ†¶åº«
+- **Codex STDIO æ©‹æŽ¥** â€” Python Proxy å°‡ STDIO MCP è½‰è­¯ç‚º HTTP MCPï¼Œè§£æ±º Codex åƒ…æ”¯æ´ STDIO çš„é™åˆ¶
+- **åƒè€ƒè¨ˆæ•¸** â€” å®‰å…¨çš„å¤šçµ‚ç«¯æ©Ÿä½¿ç”¨ï¼Œè‡ªå‹•æ¸…ç†
+- **å´©æ½°å¾©åŽŸ** â€” ä¼ºæœå™¨æ„å¤–åœæ­¢æ™‚è‡ªå‹•é‡ç½®è¨ˆæ•¸å™¨
+
+## ç³»çµ±éœ€æ±‚
+
+- [OpenMemory ä¼ºæœå™¨](https://github.com/CaviraOSS/OpenMemory) å®‰è£åœ¨ `~/OpenMemory`
+- Python 3.10+ ä¸¦å®‰è£ `fastmcp`ï¼ˆCodex CLI Proxy éœ€è¦ï¼‰
+- Node.js 18+ï¼ˆOpenMemory ä¼ºæœå™¨éœ€è¦ï¼‰
+- `curl`ã€`lsof`ï¼ˆmacOS/Linux æ¨™æº–å·¥å…·ï¼‰
+
+### å®‰è£ OpenMemory ä¼ºæœå™¨
+
+```bash
+git clone https://github.com/CaviraOSS/OpenMemory.git ~/OpenMemory
+cd ~/OpenMemory/packages/openmemory-js
+npm install
+npm run build
+```
+
+## å®‰è£
+
+```bash
+git clone git@github.com:vancelin/openmemory.git ~/dev/memory
+cd ~/dev/memory
+
+# å»ºç«‹ Python è™›æ“¬ç’°å¢ƒä¸¦å®‰è£ Proxy ä¾è³´
+uv venv .venv --python 3.11
+uv pip install fastmcp --python .venv/bin/python
+
+# å®‰è£ Shell é‰¤å­
+chmod +x install.sh openmemory-manager.sh openmemory-codex-proxy.py
+./install.sh
+```
+
+é‡æ–°å•Ÿå‹•çµ‚ç«¯æ©Ÿå¾Œï¼ŒåŸ·è¡Œ `claude`ã€`opencode`ã€`codex` æˆ– `gemini` â€” OpenMemory æœƒè‡ªå‹•å•Ÿå‹•ã€‚
+
+## æª”æ¡ˆèªªæ˜Ž
+
+| æª”æ¡ˆ | ç”¨é€” |
+|------|------|
+| `openmemory-manager.sh` | æ ¸å¿ƒç”Ÿå‘½é€±æœŸç®¡ç†å™¨ â€” åƒè€ƒè¨ˆæ•¸çš„å•Ÿå‹•/åœæ­¢ |
+| `openmemory-codex-proxy.py` | FastMCP STDIOâ†’HTTP Proxyï¼Œä¾› Codex CLI ä½¿ç”¨ |
+| `install.sh` | ä¸€éµå®‰è£ Shell é‰¤å­ï¼ˆå†ªç­‰è¨­è¨ˆï¼‰ |
+| `.mcp.json` | Claude Code / OpenCode MCP è¨­å®šï¼ˆHTTP å‚³è¼¸ï¼‰ |
+| `.mcp.json.example` | MCP è¨­å®šç¯„ä¾‹æª”æ¡ˆ |
+
+## MCP è¨­å®š
+
+### Claude Code / OpenCode â€” `.mcp.json`
+
+æ”¾åœ¨å°ˆæ¡ˆæ ¹ç›®éŒ„ï¼Œæˆ– `~/.claude/.mcp.json`ï¼ˆClaude Codeï¼‰/ `~/.opencode/.mcp.json`ï¼ˆOpenCodeï¼‰è¨­ç‚ºå…¨åŸŸï¼š
+
+```json
+{
+  "mcpServers": {
+    "openmemory": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+**æ³¨æ„ï¼š** OpenCode æ”¯æ´èˆ‡ Claude Code ç›¸åŒçš„ `.mcp.json` æ ¼å¼ä¾†è¨­å®š MCP ä¼ºæœå™¨ã€‚
+
+### Gemini CLI â€” `~/.gemini/settings.json`
+
+```json
+{
+  "mcpServers": {
+    "openmemory": {
+      "httpUrl": "http://localhost:8080/mcp",
+      "trust": true
+    }
+  }
+}
+```
+
+### Codex CLI â€” `~/.codex/config.toml`
+
+```toml
+[mcp_servers.openmemory]
+command = "/path/to/.venv/bin/python"
+args = ["/path/to/openmemory-codex-proxy.py"]
+```
+
+Codex CLI åƒ…æ”¯æ´ STDIO å‚³è¼¸ã€‚Proxy è…³æœ¬ä½¿ç”¨ FastMCP çš„ `create_proxy` åŠŸèƒ½ï¼Œé€æ˜Žåœ°å°‡æ‰€æœ‰ MCP å·¥å…·å‘¼å«æ©‹æŽ¥åˆ° OpenMemory çš„ HTTP ç«¯é»žã€‚
+
+## å¯ç”¨çš„ MCP å·¥å…·
+
+OpenMemory å‘æ‰€æœ‰é€£ç·šçš„ Agent æä¾›ä»¥ä¸‹å·¥å…·ï¼š
+
+| å·¥å…· | èªªæ˜Ž |
+|------|------|
+| `openmemory_store` | å„²å­˜è¨˜æ†¶ï¼ˆæ–‡å­—ã€äº‹å¯¦ã€æˆ–å…©è€…ï¼‰ |
+| `openmemory_query` | èªžæ„æœå°‹å·²å„²å­˜çš„è¨˜æ†¶ |
+| `openmemory_list` | åˆ—å‡ºæœ€è¿‘çš„è¨˜æ†¶ |
+| `openmemory_get` | ä¾ ID å–å¾—å–®ç­†è¨˜æ†¶ |
+| `openmemory_reinforce` | æå‡è¨˜æ†¶çš„é¡¯è‘—æ€§ |
+| `openmemory_delete` | ä¾ ID åˆªé™¤è¨˜æ†¶ |
+
+## ä½¿ç”¨æ–¹å¼
+
+OpenMemory å•Ÿå‹•å¾Œï¼Œä¸‰å€‹ CLI éƒ½å¯ä»¥é€éŽ MCP å·¥å…·å„²å­˜å’Œæœå°‹è¨˜æ†¶ã€‚ç›´æŽ¥ç”¨è‡ªç„¶èªžè¨€å³å¯ï¼š
+
+### å„²å­˜è¨˜æ†¶
+
+```
+ä½ : è¨˜ä½æˆ‘æ‰€æœ‰ç·¨è¼¯å™¨éƒ½åå¥½æš—è‰²æ¨¡å¼
+Claude: *å‘¼å« openmemory_store* â†’ å·²å„²å­˜ï¼
+```
+
+```
+ä½ : æˆ‘å–œæ­¡ç”¨ Python å¯«å¾Œç«¯ï¼Œå‰ç«¯ç”¨ React
+Gemini: *å‘¼å« openmemory_store* â†’ å·²å„²å­˜ï¼
+```
+
+```
+ä½ : è¨˜ä¸€ä¸‹ production DB port æ˜¯ 5433ï¼Œä¸æ˜¯ 5432
+Codex: *å‘¼å« openmemory_store* â†’ å·²å„²å­˜ï¼
+```
+
+### æœå°‹è¨˜æ†¶
+
+```
+ä½ : æˆ‘çš„ç·¨è¼¯å™¨åå¥½æ˜¯ä»€éº¼ï¼Ÿ
+Claude: *å‘¼å« openmemory_query("ç·¨è¼¯å™¨åå¥½")* â†’ "ä½ æ‰€æœ‰ç·¨è¼¯å™¨éƒ½åå¥½æš—è‰²æ¨¡å¼"
+```
+
+```
+ä½ : ç”Ÿç”¢ç’°å¢ƒçš„ DB port æ˜¯å¤šå°‘ï¼Ÿ
+Gemini: *å‘¼å« openmemory_query("production DB port")* â†’ "5433"
+```
+
+### è·¨å·¥å…·è¨˜æ†¶å…±äº«
+
+```
+# åœ¨ Claude Code ä¸­å„²å­˜
+ä½  (Claude): è¨˜ä½æˆ‘çš„å°ˆæ¡ˆä½¿ç”¨ PostgreSQL 16
+
+# åœ¨ Gemini CLI ä¸­è®€å–
+ä½  (Gemini): æˆ‘çš„å°ˆæ¡ˆç”¨ä»€éº¼è³‡æ–™åº«ï¼Ÿ
+Gemini: *å‘¼å« openmemory_query* â†’ "ä½ çš„å°ˆæ¡ˆä½¿ç”¨ PostgreSQL 16"
+```
+
+å°±é€™æ¨£ â€” åœ¨ä»»ä½•ä¸€å€‹ CLI å„²å­˜çš„è¨˜æ†¶ï¼Œå…¶ä»– CLI éƒ½èƒ½ç«‹å³è®€å–ã€‚
+
+## ç¤ºæ„åœ–
+
+**Claude Code** â€” é€éŽ OpenMemory MCP å·¥å…·å„²å­˜å’ŒæŸ¥è©¢è¨˜æ†¶ï¼š
+
+![Claude Code](claudecode.png)
+
+**Gemini CLI** â€” è®€å–å…¶ä»– Agent å„²å­˜çš„è¨˜æ†¶ï¼š
+
+![Gemini CLI](gemini.png)
+
+## ç’°å¢ƒè®Šæ•¸
+
+| è®Šæ•¸ | é è¨­å€¼ | èªªæ˜Ž |
+|------|--------|------|
+| `OPENMEMORY_DIR` | `~/OpenMemory/packages/openmemory-js` | OpenMemory ä¼ºæœå™¨è·¯å¾‘ |
+| `OPENMEMORY_PORT` | `8080` | ä¼ºæœå™¨é€£æŽ¥åŸ  |
+| `OPENMEMORY_URL` | `http://localhost:8080` | Codex Proxy ç›®æ¨™ URL |
+| `OPENMEMORY_LOCK_DIR` | `/tmp/openmemory` | éŽ–å®š/è¨ˆæ•¸æª”æ¡ˆç›®éŒ„ |
+| `OPENMEMORY_LOG` | `/tmp/openmemory.log` | ä¼ºæœå™¨æ—¥èªŒæª”æ¡ˆ |
+| `OPENMEMORY_USER_ID` | `$(whoami)` | è¨˜æ†¶éš”é›¢çš„é è¨­ä½¿ç”¨è€… ID |
+
+## è§£é™¤å®‰è£
+
+å¾ž `~/.zshrc` ç§»é™¤é‰¤å­å€å¡Šï¼ˆä½æ–¼ `OpenMemory auto-start/stop hooks` æ¨™è¨˜ä¹‹é–“ï¼‰ï¼š
+
+```bash
+sed -i '' '/# â”€â”€ OpenMemory auto-start/,/# â”€â”€ End OpenMemory hooks/d' ~/.zshrc
+```
+
+ç„¶å¾Œå¾žå„ CLI çš„è¨­å®šæª”ä¸­ç§»é™¤ MCP è¨­å®šã€‚
+
+## æŽˆæ¬Š
+
+MIT
+
+
+File: openmemory-main\.claude\settings.local.json
+{
+  "permissions": {
+    "allow": [
+      "mcp__web-reader__webReader",
+      "Bash(curl:*)",
+      "WebSearch",
+      "Bash(docker --version)",
+      "Bash(ollama --version)",
+      "Bash(docker info:*)",
+      "Bash(ollama list:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''name:'''', d.get\\(''''name''''\\)\\); print\\(''''scripts:'''', json.dumps\\(d.get\\(''''scripts'''',{}\\), indent=2\\)\\)\")",
+      "Bash(cp .env.example .env)",
+      "Bash(docker compose:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''name:'''', d.get\\(''''name''''\\)\\); print\\(''''main:'''', d.get\\(''''main''''\\)\\); print\\(''''bin:'''', json.dumps\\(d.get\\(''''bin'''',{}\\), indent=2\\)\\); print\\(''''scripts:'''', json.dumps\\(d.get\\(''''scripts'''',{}\\), indent=2\\)\\)\")",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(codex:*)",
+      "Bash(python3 -m json.tool)",
+      "Bash(uv pip:*)",
+      "Bash(uv venv:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(timeout 5 python openmemory-codex-proxy.py)",
+      "Bash(chmod:*)",
+      "Bash(echo:*)",
+      "Bash(launchctl list:*)",
+      "Bash(xargs kill:*)"
+    ]
+  }
+}
+
+
